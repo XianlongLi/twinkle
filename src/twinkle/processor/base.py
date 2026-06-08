@@ -523,6 +523,7 @@ class InputProcessor:
                 'position_ids',
                 'labels',
                 'completion_mask',
+                'routed_experts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
                 if key in _keys:

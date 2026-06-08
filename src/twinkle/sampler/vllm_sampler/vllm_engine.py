@@ -297,10 +297,12 @@ class VLLMEngine(BaseSamplerEngine):
             if output.finish_reason in ('stop', 'eos_token'):
                 stop_reason = 'stop'
 
+            routed_experts = getattr(output, 'routed_experts', None)
             sequences.append(SampledSequence(
                 stop_reason=stop_reason,
                 tokens=token_ids,
                 logprobs=seq_logprobs,
+                routed_experts=routed_experts,
             ))
 
         # Extract prompt logprobs if requested
