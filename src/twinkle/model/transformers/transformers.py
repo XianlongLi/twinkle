@@ -173,6 +173,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
+        enable_router_replay = kwargs.pop('enable_router_replay', False)
+        self._router_replay_enabled = bool(enable_router_replay)
+        self._router_replay_ready = False
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
@@ -349,6 +352,52 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         self._expert_parallel_applied = True
 
+    def _ensure_router_replay_ready(self):
+        """Lazily register MoE blocks and (for EP=1) wrap their forwards."""
+        if self._router_replay_ready:
+            return
+        self._router_replay_ready = True  # one-shot
+        if not self._router_replay_enabled:
+            return  # no-op when routing replay is disabled
+        model = self.strategy.unwrap_model(self.model)
+        from .moe.router_replay import apply_router_replay_patch
+        apply_router_replay_patch(model)
+
+    def _router_replay_setup(self, router_replay_action, routed_experts=None):
+        """Set up routing replay before a model forward.
+
+        Returns ``(unwrapped_model, cleanup_fn)``.
+        Call *cleanup_fn* after the forward to gather recorded indices
+        (when RECORD) and clear global state.
+        """
+        if router_replay_action is None:
+            return None, (lambda: None)
+
+        self._ensure_router_replay_ready()
+        from .moe.router_replay import (
+            set_router_replay_data, set_global_router_replay_action,
+            clear_global_router_replay_action, clear_global_indices,
+            RouterReplayAction, get_router_replay_data,
+        )
+        unwrapped = self.strategy.unwrap_model(self.model)
+        set_global_router_replay_action(router_replay_action)
+        if router_replay_action != RouterReplayAction.RECORD and routed_experts is not None:
+            set_router_replay_data(routed_experts, unwrapped)
+
+        def cleanup():
+            recorded = None
+            if router_replay_action == RouterReplayAction.RECORD:
+                ep_group = (
+                    getattr(self.strategy, 'ep_group', None)
+                    if getattr(self, '_enable_expert_parallel', False) else None
+                )
+                recorded = get_router_replay_data(unwrapped, ep_group)
+            clear_global_router_replay_action()
+            clear_global_indices()
+            return recorded
+
+        return unwrapped, cleanup
+
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():
             if not isinstance(optimizer_group, OptimizerGroup):
@@ -407,7 +456,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
+
+        # Routing replay: respects router_replay_action regardless of caller
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        routed_experts = inputs.pop('routed_experts', None)
+        _rr_unwrapped, _rr_cleanup = self._router_replay_setup(
+            router_replay_action, routed_experts)
+
         outputs = self.model(**inputs)
+
+        _recorded_routing = _rr_cleanup()
         inputs['labels'] = labels
         if labels is not None:
             loss_mask = (labels != -100).bool()
@@ -433,20 +491,29 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return_outputs = copy(outputs)
         if not return_logits:
             return_outputs['logits'] = None
+        if _recorded_routing is not None:
+            return_outputs['routed_experts'] = _recorded_routing
         return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 
+        Pass ``router_replay_action`` to control routing replay behaviour:
+        - ``RouterReplayAction.RECORD``: record routing and return ``routed_experts``
+        - ``RouterReplayAction.REPLAY_FORWARD``: replay routing from ``routed_experts``
+          in InputFeatures
+
         Args:
             inputs: The model inputs. Can be an encoded batch, or a list of `Trajectory`
             **kwargs:
                 adapter_name: Lora adapter name.
                 disable_lora: If True, disable LoRA and use base model for inference.
+                router_replay_action: Optional RouterReplayAction.
         Returns:
             The output of the model forward.
         """
+        router_replay_action = kwargs.pop('router_replay_action', None)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
@@ -480,11 +547,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
+
+            # Routing replay: handle any action generically
+            routed_experts = inputs.pop('routed_experts', None)
+            _rr_unwrapped, _rr_cleanup = self._router_replay_setup(
+                router_replay_action, routed_experts)
+
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
+
+            _recorded_routing = _rr_cleanup()
             inputs['labels'] = labels
             if labels is not None:
                 loss_mask = (labels != -100).bool()
@@ -510,6 +585,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return_outputs = copy(outputs)
             if not return_logits:
                 return_outputs['logits'] = None
+            if _recorded_routing is not None:
+                return_outputs['routed_experts'] = _recorded_routing
             return return_outputs
 
     @remote_function(collect='mean')
@@ -1194,6 +1271,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if getattr(self, '_enable_expert_parallel', False):
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=self._enable_expert_parallel)
             self._maybe_apply_expert_parallel()
+        if self._expert_parallel_applied:
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
         if isinstance(config_or_dir, str):

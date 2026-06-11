@@ -141,10 +141,15 @@ def main():
         DeviceGroup(name='sampler', ranks=list(range(MODEL_GPUS, NUM_GPUS)),
                     device_type='GPU', gpus_per_worker=SAMPLER_TP),
     ]
-    dp_size = MODEL_GPUS // (MODEL_TP * MODEL_PP)
-    model_mesh = DeviceMesh.from_sizes(
-        world_size=MODEL_GPUS, dp_size=dp_size, tp_size=MODEL_TP,
-        pp_size=MODEL_PP, ep_size=MODEL_EP, sequence_parallel=True)
+    if USE_MEGATRON:
+        dp_size = MODEL_GPUS // (MODEL_TP * MODEL_PP)
+        model_mesh = DeviceMesh.from_sizes(
+            world_size=MODEL_GPUS, dp_size=dp_size, tp_size=MODEL_TP,
+            pp_size=MODEL_PP, ep_size=MODEL_EP, sequence_parallel=True)
+    else:
+        # FSDP: only DP, no TP/PP/EP in mesh (EP is configured via fsdp_config if needed)
+        model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
+
     sampler_dp_size = SAMPLER_GPUS // SAMPLER_TP
     sampler_mesh = DeviceMesh.from_sizes(
         world_size=SAMPLER_GPUS, dp_size=sampler_dp_size, tp_size=SAMPLER_TP)
@@ -159,18 +164,21 @@ def main():
 
     if USE_MEGATRON:
         from twinkle.model.megatron import MegatronModel
+        from twinkle.model.megatron.router_replay import RouterReplayAction
         model = MegatronModel(
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
             mixed_precision='bf16',
-            router_replay_mode=ROUTER_REPLAY_MODE,
+            enable_router_replay=(ROUTER_REPLAY_MODE != 'disabled'),
         )
     else:
+        from twinkle.model.transformers.moe.router_replay import RouterReplayAction
         model = TransformersModel(
             model_id=MODEL_ID,
             device_mesh=model_mesh,
             remote_group='model',
+            enable_router_replay=(ROUTER_REPLAY_MODE != 'disabled'),
         )
 
     model.add_adapter_to_model(ADAPTER_NAME, lora_config,
@@ -278,6 +286,7 @@ def main():
             if ROUTER_REPLAY_MODE == 'R2':
                 fwd_result = model.forward_only(
                     inputs=mb_inputs,
+                    router_replay_action=RouterReplayAction.RECORD,
                     micro_batch_size=MICRO_BATCH_SIZE,
                 )
                 routed_experts = fwd_result.get('routed_experts')
@@ -291,11 +300,15 @@ def main():
                         inp['routed_experts'] = routed_experts[:, offset:offset + seq_len, :, :]
                         offset += seq_len
 
+            fb_kwargs = dict(micro_batch_size=MICRO_BATCH_SIZE)
+            if ROUTER_REPLAY_MODE in ('R2', 'R3'):
+                fb_kwargs['router_replay_action'] = RouterReplayAction.REPLAY_FORWARD
+
             model.forward_backward(
                 inputs=mb_inputs,
                 old_logps=mb_old_logps,
                 advantages=mb_advantages,
-                micro_batch_size=MICRO_BATCH_SIZE,
+                **fb_kwargs,
             )
             model.clip_grad_and_step()
             optim_step += 1

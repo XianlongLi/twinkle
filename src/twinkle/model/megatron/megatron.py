@@ -36,7 +36,7 @@ from twinkle.processor import InputProcessor
 from twinkle.template import Template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
-from .router_replay_utils import (
+from .router_replay import (
     ROUTER_REPLAY_AVAILABLE, RouterReplay, RouterReplayAction, RouterReplayHelper,
     apply_router_replay_patch, gather_router_replay_data,
     get_local_topk_idx_for_current_rank, set_router_replay_data,
@@ -114,12 +114,18 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.get('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
-        self.router_replay_mode = kwargs.get('router_replay_mode', 'disabled')
-        self.enable_router_replay = self.router_replay_mode != 'disabled'
-        if self.enable_router_replay:
+        # Router replay: enable via enable_router_replay=True in constructor.
+        # Actual recording / replay is controlled per-call via
+        # router_replay_action kwarg on forward_only / forward_backward.
+        self._router_replay_ready = False
+        enable_router_replay = kwargs.pop('enable_router_replay', False)
+        if enable_router_replay:
             if not ROUTER_REPLAY_AVAILABLE:
-                raise RuntimeError('router_replay_mode requires megatron-core with router replay support.')
+                raise RuntimeError(
+                    'enable_router_replay requires megatron-core with router replay support.')
             apply_router_replay_patch()
+            kwargs['moe_enable_routing_replay'] = True
+            self._router_replay_ready = True
         torch_util.set_device()
         self._try_init_process_group()
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
@@ -241,41 +247,21 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                      **kwargs):
         """Forward pass without gradient computation.
 
-        When ``router_replay_mode='R2'``, this pass records MoE routing
-        decisions via ``RouterReplayAction.RECORD`` and returns the gathered
-        ``routed_experts`` tensor in ``ModelOutput`` for the caller to
-        inject into the subsequent ``forward_backward`` inputs.
+        Pass ``router_replay_action=RouterReplayAction.RECORD`` to record MoE
+        routing decisions and return ``routed_experts`` in ``ModelOutput``.
 
         Args:
             inputs: Model inputs.
+            router_replay_action: Optional RouterReplayAction for routing replay.
             **kwargs: Additional arguments.
 
         Returns:
             Model outputs.
         """
-        if self.enable_router_replay and self.router_replay_mode == 'R2':
-            return self._forward_only_with_record(inputs, micro_batch_size, **kwargs)
-        return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
-
-    def _forward_only_with_record(self, inputs, micro_batch_size, **kwargs):
-        """R2 RECORD: forward-only pass that captures MoE routing decisions.
-
-        Sets RECORD action, runs forward, then gathers recorded routing data
-        across CP/TP/PP and returns it in ``result['routed_experts']``
-        as a ``[1, total_seq, all_layers, topk]`` tensor.
-        """
-        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-        try:
-            result = self.forward_backward(
-                inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
-            unwrapped_model = self.strategy.unwrap_model(self.model)[0]
-            full_routing = gather_router_replay_data(unwrapped_model.config, vp_rank=None)
-            if full_routing is not None:
-                result['routed_experts'] = full_routing
-            return result
-        finally:
-            RouterReplay.clear_global_router_replay_action()
-            RouterReplay.clear_global_indices()
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        return self.forward_backward(
+            inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True,
+            router_replay_action=router_replay_action, **kwargs)
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -324,6 +310,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
         temperature = float(kwargs.pop('temperature', 1.0))
         forward_only = kwargs.pop('forward_only', False)
         return_logits = kwargs.pop('return_logits', False)
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        routed_experts = kwargs.pop('routed_experts', None)
+        _is_replay = (
+            router_replay_action is not None
+            and router_replay_action != RouterReplayAction.DISABLED
+        )
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -420,25 +412,22 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             labels = batch.pop('labels', None)
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             vp_rank = getattr(unwrapped_model, 'vp_stage', None)
-            local_router_replay_mode = self.router_replay_mode if self.enable_router_replay else 'disabled'
-
             # 1F1B fix: if the previous microbatch left routers in REPLAY_BACKWARD
             # state (1F1B pipeline schedule), reset to REPLAY_FORWARD before the
             # current forward pass.
-            if (self.enable_router_replay
+            if (_is_replay
                     and RouterReplayHelper.is_replay_backward_action(unwrapped_model.config, vp_rank=vp_rank)):
                 RouterReplayHelper.set_micro_batch_action(
                     unwrapped_model.config, RouterReplayAction.REPLAY_FORWARD, vp_rank=vp_rank)
 
-            # R2 / R3: inject routed_experts from recorded or vLLM data
-            if local_router_replay_mode in ('R2', 'R3'):
-                routed_experts = batch.pop('routed_experts', None)
-                if routed_experts is None:
+            # Inject routed_experts for any non-RECORD replay action
+            if _is_replay and router_replay_action != RouterReplayAction.RECORD:
+                replay_data = batch.pop('routed_experts', None)
+                if replay_data is None:
                     raise ValueError(
-                        f'router_replay_mode={local_router_replay_mode} requires '
-                        '`routed_experts` in each input batch.')
+                        'router_replay_action requires `routed_experts` in each input batch.')
                 local_topk_idx = get_local_topk_idx_for_current_rank(
-                    routed_experts, unwrapped_model.config,
+                    replay_data, unwrapped_model.config,
                     batch.get('packed_seq_params'), vp_rank=vp_rank)
                 set_router_replay_data(local_topk_idx, unwrapped_model.config, vp_rank=vp_rank)
 
@@ -484,7 +473,8 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 unpacked_logits = _outputs.get('logits', None)
 
             # After forward: transition REPLAY_FORWARD -> REPLAY_BACKWARD
-            if (self.enable_router_replay
+            if (_is_replay
+                    and not forward_only
                     and RouterReplayHelper.is_replay_forward_action(unwrapped_model.config, vp_rank=vp_rank)):
                 RouterReplayHelper.set_micro_batch_action(
                     unwrapped_model.config, RouterReplayAction.REPLAY_BACKWARD, vp_rank=vp_rank)
@@ -512,14 +502,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
 
         self._accumulate_metric(optimizer_config, is_training=not forward_only)
 
-        # Set global router replay action before forward-backward
-        # R2 forward_only: RECORD is set by _forward_only_with_record — skip here
-        # R2 forward_backward / R3 (both forward_only and forward_backward): REPLAY_FORWARD
-        if self.enable_router_replay and not (self.router_replay_mode == 'R2' and forward_only):
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        # Router replay: set action before forward-backward.
+        if _is_replay:
+            RouterReplay.set_global_router_replay_action(router_replay_action)
 
+        _recorded_routing = None
         # Run forward-backward with Megatron's scheduler
-        # Megatron handles all communication internally using proper process groups
         try:
             losses = forward_backward_func(
                 forward_step_func=forward_step_func,
@@ -530,13 +518,17 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
                 micro_batch_size=micro_batch_size,
                 forward_only=forward_only,
             )
+            # RECORD: gather routing data before indices are cleared in finally
+            if (forward_only
+                    and router_replay_action is not None
+                    and router_replay_action == RouterReplayAction.RECORD):
+                unwrapped_model = self.strategy.unwrap_model(self.model)[0]
+                _recorded_routing = gather_router_replay_data(
+                    unwrapped_model.config, vp_rank=None)
         finally:
-            if self.enable_router_replay:
+            if _is_replay:
                 RouterReplay.clear_global_router_replay_action()
-                # R2 RECORD (forward_only=True): keep indices alive so
-                # _forward_only_with_record can gather them after this returns.
-                if not (self.router_replay_mode == 'R2' and forward_only):
-                    RouterReplay.clear_global_indices()
+                RouterReplay.clear_global_indices()
 
         # Extract loss from results (only last PP stage returns non-empty)
         loss = torch.tensor(0.0).to(Platform.get_local_device())
@@ -599,7 +591,10 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             optimizer_config.train_status.inputs = inputs
             optimizer_config.train_status.outputs = ModelOutput(logits=logits, loss=loss, logps=logps)
             optimizer_config.train_status.forward_kwargs = kwargs
-        return ModelOutput(logits=logits, loss=loss, logps=logps)
+        result = ModelOutput(logits=logits, loss=loss, logps=logps)
+        if _recorded_routing is not None:
+            result['routed_experts'] = _recorded_routing
+        return result
 
     @remote_function(dispatch='all')
     def clip_grad_norm(self, max_grad_norm: float = 1.0, norm_type: int = 2, **kwargs):

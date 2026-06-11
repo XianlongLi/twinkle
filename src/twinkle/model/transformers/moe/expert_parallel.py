@@ -222,12 +222,17 @@ def patch_forward(
         else:
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
+        # R2 / R3 routing replay: pass block-level replay state
+        from .router_replay import get_replay_state as _get_rs
+        replay_state = _get_rs(block_name)
+
         router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
             hidden_states=hidden_states_2d,
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
             norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            replay_state=replay_state,
             **kwargs,
         )
         # Keep routing weights in activation dtype before unpermute weighting.
@@ -507,21 +512,49 @@ def _run_router(
     top_k: int,
     router_dtype: torch.dtype,
     norm_topk_prob: bool,
+    replay_state: Any = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_kwargs = {}
     if 'input_ids' in kwargs and _module_forward_accepts_kwarg(gate, 'input_ids'):
         gate_kwargs['input_ids'] = kwargs['input_ids']
     gate_out = gate(hidden_states, **gate_kwargs)
+
+    # Resolve router_logits once — needed by both REPLAY and normal paths.
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
-        router_logits, routing_weights, selected_experts = gate_out[:3]
+        router_logits = gate_out[0]
+    else:
+        router_logits = gate_out
+
+    # Lazy import to avoid circular dependency with router_replay.py
+    from .router_replay import RouterReplayAction
+
+    # --- REPLAY_FORWARD: use injected selected_experts ---
+    if (replay_state is not None
+            and replay_state.action == RouterReplayAction.REPLAY_FORWARD
+            and replay_state.target_indices is not None):
+        selected_experts = replay_state.target_indices
+        routing_weights = torch.softmax(router_logits.float(), dim=-1)
+        routing_weights = routing_weights.gather(-1, selected_experts)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
         return router_logits, routing_weights, selected_experts
 
-    router_logits = gate_out
-    routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
-    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-    if norm_topk_prob:
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    # --- Normal path: compute routing_weights and selected_experts ---
+    if isinstance(gate_out, tuple) and len(gate_out) >= 3:
+        _rl, routing_weights, selected_experts = gate_out[:3]
+    else:
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
+        routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+
+    # --- RECORD: save selected_experts after computing them ---
+    if (replay_state is not None
+            and replay_state.action == RouterReplayAction.RECORD):
+        replay_state.recorded_indices = selected_experts.detach().clone()
+
     return router_logits, routing_weights, selected_experts
 
 
