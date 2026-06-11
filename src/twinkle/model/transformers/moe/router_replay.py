@@ -136,9 +136,10 @@ def get_router_replay_data(
 ) -> Optional[torch.Tensor]:
     """Collect ``recorded_indices`` from all registered MoE blocks in *model*.
 
-    When *ep_group* is provided (EP > 1) the local routing data is all-gathered
-    across EP ranks along the sequence dimension so the caller receives the
-    full ``[1, total_seq, num_layers, topk]`` tensor.
+    .. note::
+        *ep_group* is accepted for signature parity with the Megatron
+        version but is unused in FSDP — routing runs before the EP
+        all-to-all so every EP rank records the same indices.
 
     Returns *None* when no MoE blocks have recorded routing data.
     """
@@ -155,30 +156,7 @@ def get_router_replay_data(
         return None
 
     # Stack: [num_tokens, num_layers, topk] -> [1, num_tokens, num_layers, topk]
-    local_data = torch.stack(layers, dim=1).unsqueeze(0)
-
-    # EP all-gather along the sequence dimension (dim=1)
-    if ep_group is not None and ep_group.size() > 1:
-        local_len = torch.tensor(
-            [local_data.shape[1]], dtype=torch.long, device=local_data.device
-        )
-        ep_world = ep_group.size()
-        all_lens = [torch.zeros(1, dtype=torch.long, device=local_data.device) for _ in range(ep_world)]
-        dist.all_gather(all_lens, local_len, group=ep_group)
-        max_len = max(l.item() for l in all_lens)
-
-        B, _, L, K = local_data.shape
-        padded = torch.zeros(B, max_len, L, K, dtype=local_data.dtype, device=local_data.device)
-        padded[:, :local_data.shape[1], :, :] = local_data
-
-        gathered = [torch.zeros_like(padded) for _ in range(ep_world)]
-        dist.all_gather(gathered, padded, group=ep_group)
-
-        local_data = torch.cat(
-            [g[:, :l.item(), :, :] for g, l in zip(gathered, all_lens)], dim=1
-        )
-
-    return local_data  # [1, total_seq, num_layers, topk]
+    return torch.stack(layers, dim=1).unsqueeze(0)  # [1, total_seq, num_layers, topk]
 
 
 def apply_router_replay_patch(model: nn.Module) -> None:
