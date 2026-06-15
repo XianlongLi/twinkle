@@ -63,9 +63,9 @@ def apply_expert_parallel(
     ep_rank = ep_mesh.get_local_rank()
 
     specs = []
-    for _, block in find_moe_blocks_with_names(model):
+    for block_name, block in find_moe_blocks_with_names(model):
         spec = shard_experts(block, ep_world_size, ep_rank, cfg)
-        patch_forward(block, ep_group, ep_world_size, cfg)
+        patch_forward(block, ep_group, ep_world_size, cfg, block_name)
         specs.append(spec)
 
     return specs
@@ -160,6 +160,7 @@ def patch_forward(
     ep_group: dist.ProcessGroup,
     ep_world_size: int,
     cfg: ExpertParallelConfig,
+    block_name: str,
 ) -> None:
     """Replace the MoE block forward with EP-aware communication flow.
 
@@ -223,8 +224,8 @@ def patch_forward(
             raise ValueError(f'Unsupported hidden_states ndim: {hidden_states.ndim}')
 
         # R2 / R3 routing replay: pass block-level replay state
-        from .router_replay import get_replay_state as _get_rs
-        replay_state = _get_rs(block_name)
+        from .router_replay import get_replay_state
+        replay_state = get_replay_state(block_name)
 
         router_logits, routing_weights, selected_experts = _run_router(
             gate=gate,
@@ -534,16 +535,15 @@ def _run_router(
             and replay_state.action == RouterReplayAction.REPLAY_FORWARD
             and replay_state.target_indices is not None):
         selected_experts = replay_state.target_indices
-        routing_weights = torch.softmax(router_logits.float(), dim=-1)
+        routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
         routing_weights = routing_weights.gather(-1, selected_experts)
         if norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
         return router_logits, routing_weights, selected_experts
 
     # --- Normal path: compute routing_weights and selected_experts ---
     if isinstance(gate_out, tuple) and len(gate_out) >= 3:
-        _rl, routing_weights, selected_experts = gate_out[:3]
+        _, routing_weights, selected_experts = gate_out[:3]
     else:
         routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
         routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)

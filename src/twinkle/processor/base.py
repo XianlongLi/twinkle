@@ -40,6 +40,7 @@ class InputProcessor:
         'input_features': 0.0,
         'feature_attention_mask': 0,
         'mm_token_type_ids': 0,
+        'routed_experts': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch

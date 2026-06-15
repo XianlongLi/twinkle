@@ -173,8 +173,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._fsdp_config = dict(fsdp_config or {})
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
-        enable_router_replay = kwargs.pop('enable_router_replay', False)
-        self._router_replay_enabled = bool(enable_router_replay)
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_ready = False
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
@@ -363,15 +362,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         from .moe.router_replay import apply_router_replay_patch
         apply_router_replay_patch(model)
 
-    def _router_replay_setup(self, router_replay_action, routed_experts=None):
+    def _router_replay_setup(self, router_replay_action, routed_experts=None, batch_size=1):
         """Set up routing replay before a model forward.
 
-        Returns ``(unwrapped_model, cleanup_fn)``.
-        Call *cleanup_fn* after the forward to gather recorded indices
-        (when RECORD) and clear global state.
+        Returns ``cleanup_fn``.
+        Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
         """
-        if router_replay_action is None:
-            return None, (lambda: None)
+        if not self._router_replay_enabled or router_replay_action is None:
+            return lambda: None
 
         self._ensure_router_replay_ready()
         from .moe.router_replay import (
@@ -381,22 +379,19 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         unwrapped = self.strategy.unwrap_model(self.model)
         set_global_router_replay_action(router_replay_action)
-        if router_replay_action != RouterReplayAction.RECORD and routed_experts is not None:
+        if router_replay_action != RouterReplayAction.RECORD:
+            assert routed_experts is not None, f'routed_experts must be not None'
             set_router_replay_data(routed_experts, unwrapped)
 
         def cleanup():
             recorded = None
             if router_replay_action == RouterReplayAction.RECORD:
-                ep_group = (
-                    getattr(self.strategy, 'ep_group', None)
-                    if getattr(self, '_enable_expert_parallel', False) else None
-                )
-                recorded = get_router_replay_data(unwrapped, ep_group)
+                recorded = get_router_replay_data(unwrapped, batch_size)
             clear_global_router_replay_action()
             clear_global_indices()
             return recorded
 
-        return unwrapped, cleanup
+        return cleanup
 
     def _ensure_optimizer_dp_groups(self):
         for optimizer_group in self.optimizer_group.values():
@@ -460,12 +455,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         # Routing replay: respects router_replay_action regardless of caller
         router_replay_action = kwargs.pop('router_replay_action', None)
         routed_experts = inputs.pop('routed_experts', None)
-        _rr_unwrapped, _rr_cleanup = self._router_replay_setup(
-            router_replay_action, routed_experts)
+        rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts)
 
         outputs = self.model(**inputs)
 
-        _recorded_routing = _rr_cleanup()
+        recorded_routing = rr_cleanup()
+
         inputs['labels'] = labels
         if labels is not None:
             loss_mask = (labels != -100).bool()
@@ -491,8 +486,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         return_outputs = copy(outputs)
         if not return_logits:
             return_outputs['logits'] = None
-        if _recorded_routing is not None:
-            return_outputs['routed_experts'] = _recorded_routing
+        if recorded_routing is not None:
+            return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
@@ -513,7 +508,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns:
             The output of the model forward.
         """
-        router_replay_action = kwargs.pop('router_replay_action', None)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         disable_lora = kwargs.pop('disable_lora', False)
         temperature = float(kwargs.pop('temperature', 1.0))
@@ -549,9 +543,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             unwrapped_model = self.strategy.unwrap_model(self.model)
 
             # Routing replay: handle any action generically
+            router_replay_action = kwargs.pop('router_replay_action', None)
             routed_experts = inputs.pop('routed_experts', None)
-            _rr_unwrapped, _rr_cleanup = self._router_replay_setup(
-                router_replay_action, routed_experts)
+            rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, labels.shape[0])
 
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
@@ -559,7 +553,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             else:
                 outputs = self.model(**inputs)
 
-            _recorded_routing = _rr_cleanup()
+            recorded_routing = rr_cleanup()
+
             inputs['labels'] = labels
             if labels is not None:
                 loss_mask = (labels != -100).bool()
@@ -585,8 +580,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return_outputs = copy(outputs)
             if not return_logits:
                 return_outputs['logits'] = None
-            if _recorded_routing is not None:
-                return_outputs['routed_experts'] = _recorded_routing
+            if recorded_routing is not None:
+                return_outputs['routed_experts'] = recorded_routing
             return return_outputs
 
     @remote_function(collect='mean')
