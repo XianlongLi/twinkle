@@ -532,7 +532,7 @@ def _run_router(
 
     # --- REPLAY_FORWARD: use injected selected_experts ---
     if (replay_state is not None
-            and replay_state.action == RouterReplayAction.REPLAY_FORWARD
+            and replay_state.action != RouterReplayAction.RECORD
             and replay_state.target_indices is not None):
         selected_experts = replay_state.target_indices
         routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
