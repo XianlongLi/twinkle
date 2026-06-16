@@ -382,6 +382,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, f'routed_experts must be not None'
+            if routed_experts.dim() == 3:
+                _, num_layers, topk = routed_experts.shape
+                routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
             set_router_replay_data(routed_experts, unwrapped)
 
         def cleanup():

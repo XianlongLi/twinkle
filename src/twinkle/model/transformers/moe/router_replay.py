@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import inspect
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from twinkle import Platform
@@ -93,19 +94,20 @@ def set_router_replay_data(
     if not blocks:
         return
 
-    old_shape = routed_experts.shape
-    # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
-    if routed_experts.dim() == 4:
-        routed_experts = routed_experts.flatten(0, 1)
-    
-    if routed_experts.dim() != 3:
+    if routed_experts.dim() != 4:
         raise ValueError(
-            f'Expected routed_experts with shape [bs, seq_len, layers, topk] '
-            f'or [total_seq, layers, topk], '
-            f'got {tuple(old_shape)}'
+            f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
+            f'got {tuple(routed_experts.shape)}'
         )
-    
-    routed_experts = routed_experts.to(Platform.get_local_device())
+
+    # SP: slice full-sequence routed_experts to local SP rank tokens.
+    from ..strategy.sequence_parallel import sequence_parallel as sp
+    sp_world_size = getattr(sp, 'sp_world_size', 1)
+    if sp_world_size > 1:
+        routed_experts = routed_experts.chunk(sp_world_size, dim=1)[sp.sp_rank].contiguous()
+
+    # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
+    routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())
 
     num_layers_in_data = routed_experts.shape[1]
 
@@ -147,8 +149,24 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
     # Stack: [num_tokens, num_layers, topk]
     routed_experts = torch.stack(layers, dim=1)
     _, num_layers, topk = routed_experts.shape
-    # [num_tokens, num_layers, topk] -> [bs, seq_len, num_layers, topk]
-    return routed_experts.reshape(batch_size, -1, num_layers, topk)
+    # [num_tokens, num_layers, topk] -> [bs, local_seq_len, num_layers, topk]
+    routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
+
+    # SP: all-gather local routing data across SP ranks along seq_len dim.
+    from ..strategy.sequence_parallel import sequence_parallel as sp
+    sp_world_size = getattr(sp, 'sp_world_size', 1)
+    if sp_world_size > 1:
+        sp_group = getattr(sp, '_sp_group', None)
+        assert sp_group is not None, 'sp_group is None'
+        input_tensor = routed_experts.contiguous()
+        output_shape = list(input_tensor.shape)
+        output_shape[1] *= sp_world_size
+        gathered_tensor = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
+        dist.all_gather_into_tensor(gathered_tensor, input_tensor, group=sp_group)
+        routed_experts = gathered_tensor
+
+    # [bs, seq_len, num_layers, topk]
+    return routed_experts
 
 def apply_router_replay_patch(model: nn.Module) -> None:
     """Register MoE blocks and (for EP=1) wrap their forwards through

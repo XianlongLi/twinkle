@@ -429,9 +429,23 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
 
 
 def _is_moe_experts(experts: Any) -> bool:
-    if isinstance(experts, nn.ModuleList):
+    # Look through PEFT / LoRA wrappers that may wrap the experts module
+    # or its parameters (e.g. LoraLayer, ParamWrapper).
+    unwrapped = experts
+    while True:
+        previous = unwrapped
+        if hasattr(unwrapped, 'base_layer'):
+            unwrapped = unwrapped.base_layer
+        elif hasattr(unwrapped, 'module'):
+            unwrapped = unwrapped.module
+        elif hasattr(unwrapped, '_fsdp_wrapped_module'):
+            unwrapped = unwrapped._fsdp_wrapped_module
+        if unwrapped is previous:
+            break
+
+    if isinstance(unwrapped, nn.ModuleList):
         return True
-    if hasattr(experts, 'gate_up_proj') and hasattr(experts, 'down_proj'):
+    if hasattr(unwrapped, 'gate_up_proj') and hasattr(unwrapped, 'down_proj'):
         return True
     return False
 
