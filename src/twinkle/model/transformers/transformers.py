@@ -174,7 +174,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         self._ddp_config = ddp_config or {}
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
-        self._router_replay_ready = False
+        self._router_replay_applied = False
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         if model_id is not None:
@@ -351,16 +351,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         )
         self._expert_parallel_applied = True
 
-    def _ensure_router_replay_ready(self):
+    def _maybe_apply_router_replay(self):
         """Lazily register MoE blocks and (for EP=1) wrap their forwards."""
-        if self._router_replay_ready:
+        if not self._router_replay_enabled or self._router_replay_applied:
             return
-        self._router_replay_ready = True  # one-shot
-        if not self._router_replay_enabled:
-            return  # no-op when routing replay is disabled
         model = self.strategy.unwrap_model(self.model)
         from .moe.router_replay import apply_router_replay_patch
         apply_router_replay_patch(model)
+        self._router_replay_applied = True
 
     def _router_replay_setup(self, router_replay_action, routed_experts=None, 
                              batch_size=1, manual_cleanup=False):
@@ -372,7 +370,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not self._router_replay_enabled or router_replay_action is None:
             return lambda: None
 
-        self._ensure_router_replay_ready()
+        self._maybe_apply_router_replay()
         from .moe.router_replay import (
             set_router_replay_data, set_global_router_replay_action,
             clear_global_router_replay_action, clear_global_indices,
@@ -382,9 +380,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, f'routed_experts must be not None'
-            if routed_experts.dim() == 3:
-                _, num_layers, topk = routed_experts.shape
-                routed_experts = routed_experts.reshape(batch_size, -1, num_layers, topk)
             set_router_replay_data(routed_experts, unwrapped)
 
         def cleanup():
@@ -670,11 +665,15 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not should_sync and hasattr(self.model, 'no_sync'):
             no_sync_ctx = self.model.no_sync()
 
+        from .moe.router_replay import RouterReplayAction
+        rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
+
         with no_sync_ctx:
             if scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
+        rr_cleanup()
 
         optimizer_config.train_status.loss_value = None
 
@@ -693,12 +692,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             The output of the model forward.
         """
         outputs = self.forward(inputs=inputs, router_replay_manual_cleanup=True, **kwargs)
-        from .moe.router_replay import RouterReplayAction
-        rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
         loss = self.calculate_loss(**kwargs)
         outputs['loss'] = loss
         self.backward(**kwargs)
-        rr_cleanup()
         return outputs
 
     @remote_function()

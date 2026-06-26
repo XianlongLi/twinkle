@@ -67,6 +67,7 @@ class InputProcessor:
         self.framework = framework
         self.process_pipeline = [
             self.prepare_inputs,
+            self.align_routed_experts,
             self.pad_cp,
             self.collate_fn,
             self.to_transformers_dict,
@@ -109,7 +110,7 @@ class InputProcessor:
                 elif (isinstance(value, list) and isinstance(value[0],
                                                              (int, float, np.number))) or key == 'position_ids':
                     value = torch.tensor(value)
-                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids'):
+                elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids', 'routed_experts'):
                     value = torch.tensor(value)
                 elif key in self.VLM_CONCAT_FIELDS:
                     if not isinstance(value[0], torch.Tensor):
@@ -339,10 +340,11 @@ class InputProcessor:
         return inputs
 
     @staticmethod
-    def _pad_sequence(sequences, padding_value, padding_side):
+    def _pad_sequence(sequences, padding_value, padding_side, concat=None):
         if padding_side == 'right':
             from twinkle.utils import pad_and_stack_tensors
-            return pad_and_stack_tensors(sequences, pad_value=padding_value, concat=sequences[0].dim() >= 2)
+            return pad_and_stack_tensors(sequences, pad_value=padding_value, 
+                                         concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
             import torch
@@ -586,7 +588,8 @@ class InputProcessor:
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
                     result[key] = result[key].reshape(values[0].shape[0], len(values), -1)
                 elif isinstance(values[0], torch.Tensor):
-                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
+                    concat = False if (key == 'routed_experts') else None
+                    result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side, concat)
                     if result[key].dim() == 1:
                         result[key] = result[key].unsqueeze(0)
                 else:
@@ -699,3 +702,28 @@ class InputProcessor:
             output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
 
         return output
+    
+    def align_routed_experts(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
+
+        def align_to(_input):
+            routed_experts = _input.get('routed_experts', None)
+            input_seq_len = _input.get('length', None)
+            if input_seq_len is None:
+                input_ids = _input.get('input_ids', None)
+                input_seq_len = input_ids.shape[1] if input_ids is not None else 0
+            if routed_experts is not None:
+                # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
+                # This gap of 1 is expected
+                # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
+                experts_seq_len = routed_experts.shape[0]
+                # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
+                padding_routed_experts = routed_experts
+                padding_len = input_seq_len - experts_seq_len
+                if padding_len > 0:
+                    padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
+                                                                     'constant', self.padding_map.get('routed_experts', 0))
+                _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+
+            return _input
+
+        return [align_to(_input) for _input in inputs]

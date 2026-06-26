@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 
 import inspect
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 from twinkle import Platform
@@ -30,7 +29,6 @@ class RouterReplayAction(Enum):
     REPLAY_FORWARD = "replay_forward"  # Replay the recorded topk indices for forward pass
     REPLAY_BACKWARD = "replay_backward"  # Replay topk indices for re-compute during backward pass
 
-
 # ---------------------------------------------------------------------------
 # Global registry: {block_name: _RouterReplayState}
 # ---------------------------------------------------------------------------
@@ -45,23 +43,19 @@ class _RouterReplayState:
 
 _registry: Dict[str, _RouterReplayState] = {}
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 
 def set_global_router_replay_action(action: RouterReplayAction) -> None:
     """Set *action* on every registered MoE block."""
     for state in _registry.values():
         state.action = action
 
-
 def clear_global_router_replay_action() -> None:
     """Reset action to None on every registered MoE block."""
     for state in _registry.values():
         state.action = None
-
 
 def clear_global_indices() -> None:
     """Clear recorded / target indices on every registered MoE block."""
@@ -69,11 +63,9 @@ def clear_global_indices() -> None:
         state.recorded_indices = None
         state.target_indices = None
 
-
 def get_replay_state(block_name: str) -> Optional[_RouterReplayState]:
     """Return the replay state for *block_name*, or *None*."""
     return _registry.get(block_name)
-
 
 def set_router_replay_data(
     routed_experts: torch.Tensor,
@@ -88,9 +80,7 @@ def set_router_replay_data(
     if routed_experts is None:
         return
 
-    from .expert_parallel import find_moe_blocks_with_names
-
-    blocks = find_moe_blocks_with_names(model)
+    blocks = _find_moe_blocks_with_names(model)
     if not blocks:
         return
 
@@ -102,9 +92,18 @@ def set_router_replay_data(
 
     # SP: slice full-sequence routed_experts to local SP rank tokens.
     from ..strategy.sequence_parallel import sequence_parallel as sp
-    sp_world_size = getattr(sp, 'sp_world_size', 1)
+    sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
-        routed_experts = routed_experts.chunk(sp_world_size, dim=1)[sp.sp_rank].contiguous()
+        _, _, _, _, _, _, extra_values = sp.pad_and_split_inputs(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            real_position_ids = sp.real_position_ids,
+            extra_split_values=[(routed_experts, 0, 1)])
+        routed_experts = extra_values[0]
 
     # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
     routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())
@@ -123,7 +122,6 @@ def set_router_replay_data(
         if target.numel() > 0:
             state.target_indices = target
 
-
 def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Tensor]:
     """Collect ``recorded_indices`` from all registered MoE blocks in *model*.
 
@@ -134,9 +132,10 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
 
     Returns *None* when no MoE blocks have recorded routing data.
     """
-    from .expert_parallel import find_moe_blocks_with_names
-
-    blocks = find_moe_blocks_with_names(model)
+    blocks = _find_moe_blocks_with_names(model)
+    if not blocks:
+        return None
+    
     layers = []
     for name, _ in blocks:
         state = _registry.get(name)
@@ -154,16 +153,9 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
 
     # SP: all-gather local routing data across SP ranks along seq_len dim.
     from ..strategy.sequence_parallel import sequence_parallel as sp
-    sp_world_size = getattr(sp, 'sp_world_size', 1)
+    sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
-        sp_group = getattr(sp, '_sp_group', None)
-        assert sp_group is not None, 'sp_group is None'
-        input_tensor = routed_experts.contiguous()
-        output_shape = list(input_tensor.shape)
-        output_shape[1] *= sp_world_size
-        gathered_tensor = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
-        dist.all_gather_into_tensor(gathered_tensor, input_tensor, group=sp_group)
-        routed_experts = gathered_tensor
+        routed_experts = sp.gather(routed_experts, dim=1, position_ids=sp.real_position_ids)
 
     # [bs, seq_len, num_layers, topk]
     return routed_experts
@@ -178,9 +170,7 @@ def apply_router_replay_patch(model: nn.Module) -> None:
     if getattr(model, '_rr_patched', False):
         return
 
-    from .expert_parallel import find_moe_blocks_with_names
-
-    blocks = list(find_moe_blocks_with_names(model))
+    blocks = _find_moe_blocks_with_names(model)
     if not blocks:
         return
 
@@ -209,7 +199,6 @@ def apply_router_replay_patch(model: nn.Module) -> None:
     _wrap_all_moe_blocks(blocks)
     model._rr_patched = True
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -218,6 +207,12 @@ def _is_ep_patched(block: nn.Module) -> bool:
     """Return True if *block* has already been patched by expert_parallel."""
     return getattr(block, '_ep_patched', False)
 
+def _find_moe_blocks_with_names(model: nn.Module) -> List[tuple[str, nn.Module]]:
+    from .expert_parallel import find_moe_blocks_with_names
+    # Strip PEFT wrapper so block names match those used by EP patch_forward
+    unwrap = model.get_base_model() if hasattr(model, 'get_base_model') else model
+    blocks = list(find_moe_blocks_with_names(unwrap))
+    return blocks
 
 def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
     """Replace each MoE block's forward with a wrapper that calls

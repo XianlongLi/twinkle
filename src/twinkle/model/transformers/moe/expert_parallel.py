@@ -429,9 +429,9 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
 
 
 def _is_moe_experts(experts: Any) -> bool:
+    unwrapped = experts
     # Look through PEFT / LoRA wrappers that may wrap the experts module
     # or its parameters (e.g. LoraLayer, ParamWrapper).
-    unwrapped = experts
     while True:
         previous = unwrapped
         if hasattr(unwrapped, 'base_layer'):
