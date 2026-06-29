@@ -105,12 +105,12 @@ def _normalize_tool_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             nxt_text = msg_content_text(messages[j])
             if not nxt_text:
                 break
-            if parser.detect_result(nxt_text):
-                body = parser.parse_result(nxt_text)
-            elif tc_idx == 0 and len(tc_list) == 1:
-                body = nxt_text
-            else:
-                break
+            body = parser.extract_tool_result(nxt_text)
+            if body is None:
+                if tc_idx == 0 and len(tc_list) == 1:
+                    body = nxt_text
+                else:
+                    break
             out.append({
                 'role': 'tool',
                 'content': body,

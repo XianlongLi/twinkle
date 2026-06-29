@@ -1,16 +1,20 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 # EP + FSDP2 + LoRA training for Qwen3.5-MoE.
-# ENABLE_EP=1 trains expert LoRA with target_parameters.
-# ENABLE_EP=0 runs plain FSDP2 LoRA and does not train expert parameters.
+# All training config passed as CLI flags. Override at invocation, e.g.:
+#   sh ep_fsdp2_lora_qwen3_5_moe.sh --batch-size 8 --lr 5e-5
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-export ENABLE_EP="${ENABLE_EP:-1}"
-export BATCH_SIZE="${BATCH_SIZE:-4}"
-export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-4}"
-export OUTPUT_DIR="${OUTPUT_DIR:-./output_qwen3_5_moe}"
-
-torchrun --nproc-per-node="${NPROC_PER_NODE}" \
-  cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --nproc-per-node=8 \
+  cookbook/transformers/ep_fsdp2_lora_qwen3_5_moe.py \
+    --model-id ms://Qwen/Qwen3.5-30B-A3B \
+    --dataset-id ms://swift/self-cognition \
+    --template-cls Qwen3_5Template \
+    --dp-size 4 \
+    --ep-size 2 \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --output-dir ./output_qwen3_5_moe \
+    --enable-ep 1 \
+    "$@"

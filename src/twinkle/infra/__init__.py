@@ -1,11 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import functools
 import inspect
-import itertools
 import json
 import numpy as np
 import os
-import random
 import sys
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
@@ -59,7 +57,7 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
             prefix = f'[twinkle driver caller: {caller}] '
             exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(), )
             exc._twinkle_caller_augmented = True
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa
         pass
 
 
@@ -404,6 +402,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
 
         return result
     elif dispatch == 'slice_dp':
+        assert device_mesh is not None
         # split by dp. each worker in one ep will receive the same argument
         result = []
         # if device_mesh is not None:
@@ -420,14 +419,6 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
             import torch
             if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
-                if device_mesh is None:
-                    total = len(arg)
-                    chunk = max(1, (total + n - 1) // n)
-                    for i in range(n):
-                        start = i * chunk
-                        end = min(total, start + chunk)
-                        _args.append(arg[start:end])
-                    return _args
                 for i in range(n):
                     _args.append(arg[device_mesh.get_slice(
                         len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])
@@ -696,11 +687,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
     return decorator
 
 
-def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
+def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
                     sync: bool = False,
-                    lazy_collect: Optional[bool] = None):
+                    lazy_collect: Optional[bool] = None,
+                    timeout: Optional[float] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -726,6 +718,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
         lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
+        timeout: Timeout in seconds for ray.get() when collecting results. Instance attribute ``_ray_get_timeout`` overrides this.
     """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -773,7 +766,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
                         result = execute_method(func.__name__, _workers_and_args)
                         # This is a result future, call it to get the actual result
-                        result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
+                        _rgt = getattr(self, '_ray_get_timeout', None) or timeout
+                        result_func = RayHelper.do_get_and_collect_func(
+                            _collect_func, collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = _lazy_collect
                         if func.__name__ == '__iter__':
                             # return self
@@ -803,18 +798,13 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                             # And this is user independent, only decided by the code.
                             _local_lazy_collect = self._lazy_collect
                         if _local_lazy_collect:
-                            # Wrap the deferred collector so that exceptions
-                            # raised when the caller later materializes the
-                            # result also trigger the notifier. Attributes
-                            # (``_futures`` etc.) on the original collector
-                            # are preserved for downstream code paths.
                             _orig_result_func = result_func
 
                             @functools.wraps(_orig_result_func)
                             def _notifying_result_func(*rargs, **rkwargs):
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
-                                except Exception as _e:  # noqa: BLE001
+                                except Exception as _e:  # noqa
                                     _tag_exc(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise

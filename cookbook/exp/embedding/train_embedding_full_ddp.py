@@ -1,14 +1,12 @@
-"""LoRA embedding training with online condenser self-improvement.
+"""LoRA embedding training with online compression via frozen vLLM condenser.
 
 Architecture (8 GPUs total):
   - Ranks 0-3 (``model``): Trainable embedding model with LoRA, InfoNCE loss.
-  - Ranks 4-5 (``condenser_sampler``): Frozen vLLM condenser for online compression.
-  - Ranks 6-7 (``condenser_model``): Trainable condenser with LoRA for self-improvement.
+  - Ranks 4-7 (``condenser_sampler``): Frozen vLLM condenser for online compression.
 
-When the condenser sampler truncates (stop_reason='length'), an external OpenAI-
-compatible API produces the correct compression. The failure is logged as SFT
-training data. A background thread retrains the condenser on accumulated failures
-mixed with condense_300K, then syncs weights back to the sampler.
+When the condenser sampler truncates or regresses to the legacy schema, an
+external OpenAI-compatible API produces the correct compression. The failure is
+logged to failures.jsonl for offline SFT data regeneration.
 
 Launch:
     python cookbook/exp/train_embedding_lora_ddp.py
@@ -19,6 +17,7 @@ import os
 import re
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -27,7 +26,6 @@ import swanlab
 
 import twinkle
 from twinkle import DeviceGroup, DeviceMesh, get_device_placement, get_logger
-from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.data_format import SamplingParams
 from twinkle.dataloader import DataLoader
 from twinkle.loss import InfonceLoss
@@ -35,12 +33,13 @@ from twinkle.metric import EmbeddingMetric
 from twinkle.model import TransformersModel
 from twinkle.processor import InputProcessor
 from twinkle.sampler import vLLMSampler
-from twinkle.template import Template
+from twinkle.template import Qwen3_5Template, Template
 from twinkle.utils.parallel import PosixFileLock
 from twinkle_agentic.protocol.openai import OpenAI as OpenAIClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dataset_think import get_dataset  # noqa: E402
+from dataset_think import get_dataset as get_dataset_think  # noqa: E402
+from dataset_index import get_dataset as get_dataset_index  # noqa: E402
 
 logger = get_logger()
 
@@ -54,29 +53,33 @@ TEMPLATE_NAME = 'Qwen3_5Template'
 
 # -- GPU placement (8 total) --------------------------------------------------
 MODEL_GPUS = int(os.environ.get('MODEL_GPUS', 4))
-CONDENSER_SAMPLER_GPUS = int(os.environ.get('CONDENSER_SAMPLER_GPUS', 2))
-CONDENSER_MODEL_GPUS = int(os.environ.get('CONDENSER_MODEL_GPUS', 2))
-NUM_GPUS = MODEL_GPUS + CONDENSER_SAMPLER_GPUS + CONDENSER_MODEL_GPUS
+CONDENSER_SAMPLER_GPUS = int(os.environ.get('CONDENSER_SAMPLER_GPUS', 4))
+NUM_GPUS = MODEL_GPUS + CONDENSER_SAMPLER_GPUS
 
 # -- Embedding training hyper-params ------------------------------------------
 EMB_MAX_LENGTH = 8192
 HARD_NEGATIVES = None
-TEMPERATURE = 0.03
+# 0.07 keeps gradient on diag pairs until cosine clears ~0.75; 0.03 saturated near 0.40.
+TEMPERATURE = 0.07
 
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 32))
-LEARNING_RATE = 1.5e-6
+LEARNING_RATE = 1e-5
 GRADIENT_ACCUMULATION_STEPS = 1
 LOG_INTERVAL = 2
-SAVE_INTERVAL = 4000
-NUM_EPOCHS = 2
+SAVE_INTERVAL = 2000
+NUM_EPOCHS = 1
 
 TOTAL_SAMPLES: Optional[int] = None
+# Post-build caps on each loader (None = no cap). Applied via .select() before mix.
+THINK_CAP: Optional[int] = 400_000
+INDEX_CAP: Optional[int] = 400_000
+MIX_SHUFFLE_SEED = 42
 
 # -- Resume from checkpoint ---------------------------------------------------
-RESUME_CHECKPOINT = os.environ.get(
-    'RESUME_CHECKPOINT',
-    './output/embedding_lora_transformers/step_16000')
-RESUME_STEP = int(os.environ.get('RESUME_STEP', 16000))
+# Empty by default — build_model falls back to MODEL_ID (the published emb model).
+# Set both to point at a local in-progress run only when resuming the *same* schedule.
+RESUME_CHECKPOINT = os.environ.get('RESUME_CHECKPOINT', '')
+RESUME_STEP = int(os.environ.get('RESUME_STEP', 0))
 
 # -- Online-compression knobs -------------------------------------------------
 # Below this length, condenser fabricates content for open-ended short prompts;
@@ -87,16 +90,18 @@ COMPRESS_TEMPERATURE = 0.2
 COMPRESS_TOP_P = 0.5
 COMPRESS_MAX_MODEL_LEN = 32768
 
+# How many BATCH_SIZE chunks to fetch and compress in one vLLM call.
+PREFETCH_BATCH_MULTIPLIER = int(os.environ.get('PREFETCH_BATCH_MULTIPLIER', 8))
+
 # -- OpenAI API fallback for truncated compressions ---------------------------
 COMPRESS_API_KEY = os.environ.get('COMPRESS_API_KEY', '')
 COMPRESS_BASE_URL = os.environ.get('COMPRESS_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
 COMPRESS_MODEL = os.environ.get('COMPRESS_MODEL', 'qwen3.7-max')
-
-# -- Condenser retraining knobs -----------------------------------------------
-CONDENSER_DATASET_ID = 'ms://twinkle-kit/condense_300K'
-CONDENSER_RETRAIN_SAMPLES = 128
-CONDENSER_RETRAIN_EPOCHS = 3
-CONDENSER_RETRAIN_LR = 1e-5
+# Minimum gap between API calls (seconds); bounds dashscope qps under provider limits.
+API_MIN_INTERVAL = float(os.environ.get('API_MIN_INTERVAL', 0.1))
+API_CONCURRENCY = int(os.environ.get('API_CONCURRENCY', 8))
+# vLLM sampler timeout (seconds); if a sample() call exceeds this, fall back to API.
+SAMPLER_TIMEOUT = float(os.environ.get('SAMPLER_TIMEOUT', 300))
 
 # -- Output paths -------------------------------------------------------------
 OUTPUT_DIR = f'./output/embedding_lora_{BACKEND}'
@@ -203,6 +208,17 @@ _failure_lock: Optional[PosixFileLock] = None
 # Monotonic global sample id; per-batch index would alias across batches.
 _sample_counter = 0
 _sample_counter_lock = threading.Lock()
+
+_api_throttle_lock = threading.Lock()
+_api_last_call = [0.0]
+
+
+def _api_throttle():
+    with _api_throttle_lock:
+        gap = time.monotonic() - _api_last_call[0]
+        if gap < API_MIN_INTERVAL:
+            time.sleep(API_MIN_INTERVAL - gap)
+        _api_last_call[0] = time.monotonic()
 
 
 def _next_sample_id() -> int:
@@ -314,11 +330,40 @@ def save_checkpoint(model, name: str):
 # Compression prompt building
 # =============================================================================
 
+# Hard-templated hints: the condenser SFT prior maps `Skill` to the legacy
+# `Use when: / numbered steps / Output:` skeleton on long inputs; embedding the
+# exact 4-line body template + explicit negative constraints is the only way to
+# override it deterministically across query and cot sides.
 EMBED_QUERY_Q = (
+    'Summarize this query for retrieval. '
+    'The body of ## Summary MUST follow this EXACT 4-line template — '
+    'do NOT emit "Use when:", numbered procedure steps, or "Output:":\n'
+    'Topic: <specific pattern name — scope>\n'
+    'Problem: <what concrete problem is being asked>\n'
+    'Skill: <which specific method/technique/pattern is required to solve it>\n'
+    'Knowledge: <which domains/concepts/facts must be invoked>\n'
+    'Then emit the mandatory ## More section as usual. '
+    'Topic must name the specific pattern, never generic labels.')
+EMBED_QUERY_COT = (
+    'Summarize this reasoning trace for retrieval. '
+    'The body of ## Summary MUST follow this EXACT 4-line template — '
+    'do NOT emit "Use when:", numbered procedure steps, or "Output:":\n'
+    'Topic: <specific pattern name — scope>\n'
+    'Problem: <what concrete problem this trace tackled>\n'
+    'Skill: <which specific method/technique/pattern was applied>\n'
+    'Knowledge: <which domains/concepts/facts were used>\n'
+    'Then emit the mandatory ## More section as usual. '
+    'Topic must name the specific pattern, never generic labels.')
+
+# Legacy schema (Use when: / numbered steps / Output:) — mixed in 50/50 with the
+# new schema to expose the embedder to schema-invariant semantic alignment.
+# Both query and cot of the SAME pair always use the SAME schema; cross-schema
+# anchors and positives would re-introduce the schema asymmetry we just fixed.
+EMBED_QUERY_Q_LEGACY = (
     'What problem does this passage address, and what skill or method is needed? '
     'Topic must name the specific pattern, never generic labels. '
     'Compress into a retrieval-friendly need description.')
-EMBED_QUERY_COT = (
+EMBED_QUERY_COT_LEGACY = (
     'Extract the reusable skill: trigger conditions, key steps, and expected output. '
     'Topic names the method/pattern; format as "Use when: ...", numbered steps, '
     '"Output: ...". Compress into a standardized procedure for retrieval.')
@@ -342,45 +387,59 @@ def _extract_query_cot(row: Dict[str, Any]):
 def _build_compress_prompts(rows: List[Dict[str, Any]]) -> tuple:
     """Build prompts for compressing both query and cot per row.
 
-    Returns (prompts, valid_indices, raw_pairs, prompt_queries, passthrough) where:
+    Returns (prompts, valid_indices, raw_pairs, prompt_queries, passthrough, schemas)
+    where:
     - prompts: flat-interleaved [query_0, cot_0, query_1, cot_1, ...]; ``None`` means
       passthrough (use raw text directly, do not call sampler)
     - valid_indices: which rows passed the min-length filter
     - raw_pairs: [(query, cot), ...]
     - prompt_queries: the query string used for each prompt (for failure logging)
     - passthrough: parallel to prompts; non-None text means "use this verbatim as qc"
+    - schemas: parallel to prompts; 'new' or 'legacy', drives validator branch
     """
     prompts: List[Optional[Dict[str, Any]]] = []
     valid_indices: List[int] = []
     raw_pairs: List[tuple] = []
     prompt_queries: List[str] = []
     passthrough: List[Optional[str]] = []
+    schemas: List[str] = []
+    # Conservative char budget: 32768 max_length - 8192 gen - ~2k prompt overhead = ~22k tokens.
+    # 30k cap bounds vLLM batch latency (vLLM batches by max prompt length).
+    _MAX_COT_CHARS = 30_000
     for i, row in enumerate(rows):
         query, cot = _extract_query_cot(row)
         if not query or len(cot) < MIN_TEXT_CHARS:
             continue
+        if len(cot) > _MAX_COT_CHARS:
+            continue
         valid_indices.append(i)
         raw_pairs.append((query, cot))
+        # 50/50 schema mix; same schema for query+cot of one pair to keep alignment.
+        schema = 'legacy' if (i % 2 == 0) else 'new'
+        q_hint = EMBED_QUERY_Q_LEGACY if schema == 'legacy' else EMBED_QUERY_Q
+        c_hint = EMBED_QUERY_COT_LEGACY if schema == 'legacy' else EMBED_QUERY_COT
         # Short query bypasses condenser to avoid skeleton-induced hallucination.
         if len(query) < MIN_TEXT_CHARS:
             prompts.append(None)
             passthrough.append(query)
         else:
-            user = COMPRESS_USER.format(query=EMBED_QUERY_Q, text=query)
+            user = COMPRESS_USER.format(query=q_hint, text=query)
             prompts.append({'messages': [
                 {'role': 'system', 'content': COMPRESS_SYSTEM},
                 {'role': 'user', 'content': user},
             ]})
             passthrough.append(None)
-        prompt_queries.append(EMBED_QUERY_Q)
-        user = COMPRESS_USER.format(query=EMBED_QUERY_COT, text=cot)
+        prompt_queries.append(q_hint)
+        schemas.append(schema)
+        user = COMPRESS_USER.format(query=c_hint, text=cot)
         prompts.append({'messages': [
             {'role': 'system', 'content': COMPRESS_SYSTEM},
             {'role': 'user', 'content': user},
         ]})
-        prompt_queries.append(EMBED_QUERY_COT)
+        prompt_queries.append(c_hint)
         passthrough.append(None)
-    return prompts, valid_indices, raw_pairs, prompt_queries, passthrough
+        schemas.append(schema)
+    return prompts, valid_indices, raw_pairs, prompt_queries, passthrough, schemas
 
 
 def _get_first_feature(decoded_text: str, template: Template, role: str) -> Optional[Dict[str, Any]]:
@@ -405,13 +464,24 @@ def _get_first_feature(decoded_text: str, template: Template, role: str) -> Opti
 # OpenAI API fallback
 # =============================================================================
 
-def _is_truncated_compression(text: str) -> bool:
-    """Detect structurally incomplete output that vLLM may report as stop_reason='stop'.
+_LEGACY_USE_WHEN_RE = re.compile(r'(?im)^\s*Use when\s*:')
+_SCHEMA_MARKERS = ('Problem:', 'Skill:', 'Knowledge:')
 
-    The condenser sometimes emits a chat-template token mid-skeleton (which we then
-    strip), so the visible text ends mid-sentence even though stop_reason!='length'.
-    The COMPRESS_SYSTEM skeleton mandates a `## More` section ending in a bullet list;
-    its absence is an unambiguous truncation signal.
+
+def _is_truncated_compression(text: str, schema: str = 'new') -> bool:
+    """Reject structurally incomplete OR schema-regressed condenser output.
+
+    Triggers API fallback when the vLLM output:
+      * lacks ``## Summary`` / ``## More``,
+      * has an empty or unterminated ``## More`` bullet list, or
+      * (schema='new' only) regresses to the legacy ``Use when: / numbered-steps /
+        Output:`` skeleton instead of the mandated Problem/Skill/Knowledge 4-line
+        body — the dominant cot-side failure mode that drives sim < 0.45 drops on
+        the RAG index.
+
+    For schema='legacy', body markers are intentionally NOT enforced: the legacy
+    template legitimately emits ``Use when:`` and the SFT prior already produces
+    that shape natively, so only structural completeness is checked.
     """
     if not text or not text.strip():
         return True
@@ -423,11 +493,18 @@ def _is_truncated_compression(text: str) -> bool:
     last_line = after_more.splitlines()[-1].strip()
     if not (last_line.startswith('-') or last_line.endswith(')')):
         return True
+    if schema == 'new':
+        summary_body = text.split('## Summary', 1)[1].split('## More', 1)[0]
+        if _LEGACY_USE_WHEN_RE.search(summary_body):
+            return True
+        if not all(marker in summary_body for marker in _SCHEMA_MARKERS):
+            return True
     return False
 
 
 def _api_compress(api_client: OpenAIClient, prompt: Dict[str, Any]) -> Optional[str]:
     """Call external API to compress when vLLM truncates."""
+    _api_throttle()
     trajectory = {'messages': prompt['messages']}
     # Cap max_tokens to leave ample prompt headroom inside the API model context.
     sp = SamplingParams(temperature=0.2, max_tokens=8192)
@@ -447,60 +524,11 @@ def _api_compress(api_client: OpenAIClient, prompt: Dict[str, Any]) -> Optional[
 
 
 # =============================================================================
-# Condenser Retrainer (background thread)
-# =============================================================================
-
-class CondenserRetrainer:
-    """Async condenser self-improvement: retrains from failures, syncs to sampler."""
-
-    def __init__(self, condenser_model, ckpt_manager: CheckpointEngineManager,
-                 condenser_sampler):
-        self._model = condenser_model
-        self._ckpt_manager = ckpt_manager
-        self._sampler = condenser_sampler
-        self._signal = threading.Event()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._condense_300k_cache = None
-        self._retrain_count = 0
-        # Prevents sample() and sync_weights() from running concurrently
-        self.sampler_lock = threading.Lock()
-
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        self._signal.set()
-        self._thread.join(timeout=10)
-
-    def notify_failure(self):
-        self._signal.set()
-
-    def _loop(self):
-        while not self._stop.is_set():
-            self._signal.wait(timeout=60)
-            if self._stop.is_set():
-                break
-            if not self._signal.is_set():
-                continue
-            self._signal.clear()
-            try:
-                self._retrain_and_sync()
-            except Exception as exc:
-                logger.error(f'[condenser_retrain] crashed: {exc}')
-
-    def _retrain_and_sync(self):
-        # Retrain + sync temporarily disabled; failures.jsonl is written directly by _log_failure.
-        pass
-
-
-# =============================================================================
 # Main training
 # =============================================================================
 
 def train():
-    # -------- Device groups (3 groups) ----------------------------------------
+    # -------- Device groups (2 groups) ----------------------------------------
     device_groups = [
         DeviceGroup(name='model',
                     ranks=list(range(MODEL_GPUS)),
@@ -508,22 +536,31 @@ def train():
         DeviceGroup(name='condenser_sampler',
                     ranks=list(range(MODEL_GPUS, MODEL_GPUS + CONDENSER_SAMPLER_GPUS)),
                     device_type='GPU'),
-        DeviceGroup(name='condenser_model',
-                    ranks=list(range(MODEL_GPUS + CONDENSER_SAMPLER_GPUS, NUM_GPUS)),
-                    device_type='GPU'),
     ]
     model_mesh = DeviceMesh.from_sizes(world_size=MODEL_GPUS, dp_size=MODEL_GPUS)
     condenser_sampler_mesh = DeviceMesh.from_sizes(
         world_size=CONDENSER_SAMPLER_GPUS, dp_size=CONDENSER_SAMPLER_GPUS)
-    condenser_model_mesh = DeviceMesh.from_sizes(
-        world_size=CONDENSER_MODEL_GPUS, dp_size=1, fsdp_size=CONDENSER_MODEL_GPUS)
 
     twinkle.initialize(mode='ray', nproc_per_node=NUM_GPUS, groups=device_groups)
 
     # -------- Data -----------------------------------------------------------
-    dataset = get_dataset(total=TOTAL_SAMPLES, load_from_cache_file=True)
-    dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, shuffle=True)
-    total_forward_steps = len(dataloader) * NUM_EPOCHS
+    dataset = get_dataset_think(total=TOTAL_SAMPLES, load_from_cache_file=True)
+    if THINK_CAP and len(dataset.dataset) > THINK_CAP:
+        dataset.dataset = dataset.dataset.select(range(THINK_CAP))
+    if INDEX_CAP != 0:
+        from datasets import concatenate_datasets
+        ds_index = get_dataset_index(total=None, load_from_cache_file=True)
+        if INDEX_CAP and len(ds_index.dataset) > INDEX_CAP:
+            ds_index.dataset = ds_index.dataset.select(range(INDEX_CAP))
+        n_think = len(dataset.dataset)
+        n_index = len(ds_index.dataset)
+        # Both loaders emit identical {id, source, messages} schema post-QP.
+        dataset.dataset = concatenate_datasets(
+            [dataset.dataset, ds_index.dataset]).shuffle(seed=MIX_SHUFFLE_SEED)
+        logger.info(f'[mix] think={n_think} + index={n_index} → total={len(dataset.dataset)}')
+    _mega_batch_size = BATCH_SIZE * PREFETCH_BATCH_MULTIPLIER
+    dataloader = DataLoader(dataset=dataset, batch_size=_mega_batch_size, shuffle=True)
+    total_forward_steps = len(dataloader) * PREFETCH_BATCH_MULTIPLIER * NUM_EPOCHS
     optimizer_steps = total_forward_steps // GRADIENT_ACCUMULATION_STEPS
 
     # -------- Embedding model (4 GPU) ----------------------------------------
@@ -534,10 +571,10 @@ def train():
     setup_optimizer(model, optimizer_steps)
     model.add_metric(EmbeddingMetric, is_training=True)
 
-    # -------- Condenser sampler (2 GPU, vLLM) --------------------------------
-    emb_template = Template(model_id=MODEL_ID, max_length=EMB_MAX_LENGTH, enable_thinking=False)
+    # -------- Condenser sampler (4 GPU, vLLM) --------------------------------
+    emb_template = Qwen3_5Template(model_id=MODEL_ID, max_length=EMB_MAX_LENGTH, enable_thinking=False)
     # Special tokens come from the condenser tokenizer because the leak we strip is in its decoded output.
-    condenser_template = Template(model_id=CONDENSE_MODEL_ID, max_length=DATASET_MAX_TOKENS,
+    condenser_template = Qwen3_5Template(model_id=CONDENSE_MODEL_ID, max_length=DATASET_MAX_TOKENS,
                                   enable_thinking=False)
     _special_tokens = set(condenser_template.tokenizer.all_special_tokens)
     condenser_sampler = vLLMSampler(
@@ -559,23 +596,32 @@ def train():
         num_samples=1,
     )
 
-    # -------- Condenser model (2 GPU, trainable full-param) -------------------
-    condenser_model = TransformersModel(
-        model_id=CONDENSE_MODEL_ID,
-        device_mesh=condenser_model_mesh,
-        remote_group='condenser_model',
-    )
-    condenser_model.set_optimizer(optimizer_cls='AdamW', lr=CONDENSER_RETRAIN_LR)
+    condenser_sampler._ray_get_timeout = SAMPLER_TIMEOUT
+    _sampler_epoch = 0
 
-    # -------- CheckpointEngineManager: condenser_model → condenser_sampler ---
-    condenser_ckpt_manager = CheckpointEngineManager(
-        model=condenser_model, sampler=condenser_sampler)
-    condenser_ckpt_manager.sync_weights()
-
-    # -------- Background retrainer -------------------------------------------
-    retrainer = CondenserRetrainer(condenser_model, condenser_ckpt_manager,
-                                   condenser_sampler)
-    retrainer.start()
+    def _rebuild_sampler():
+        """Kill stuck actors and recreate the vLLM sampler from scratch."""
+        nonlocal condenser_sampler, _sampler_epoch
+        import ray
+        for actor in getattr(condenser_sampler, '_actors', []):
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+        logger.warning('[sampler] killed stuck actors, recreating sampler \u2026')
+        new = vLLMSampler(
+            model_id=CONDENSE_MODEL_ID,
+            engine_args={'gpu_memory_utilization': 0.8, 'max_model_len': COMPRESS_MAX_MODEL_LEN},
+            device_mesh=condenser_sampler_mesh,
+            remote_group='condenser_sampler',
+        )
+        new.set_template(
+            TEMPLATE_NAME, model_id=CONDENSE_MODEL_ID, enable_thinking=False,
+            truncation_strategy='delete', max_length=DATASET_MAX_TOKENS)
+        new._ray_get_timeout = SAMPLER_TIMEOUT
+        condenser_sampler = new
+        _sampler_epoch += 1
+        logger.warning('[sampler] sampler rebuilt successfully')
 
     # -------- OpenAI API client for fallback ---------------------------------
     api_client = OpenAIClient(
@@ -606,28 +652,41 @@ def train():
     # -------- Train loop -----------------------------------------------------
     def _sample_batch(raw_batch):
         """Compress via vLLM sampler; fall back to API on truncation."""
-        compress_prompts, valid_indices, raw_pairs, prompt_queries, passthrough = \
+        _t_enter = time.monotonic()
+        compress_prompts, valid_indices, raw_pairs, prompt_queries, passthrough, schemas = \
             _build_compress_prompts(raw_batch)
-        if not compress_prompts:
+        _t_build = time.monotonic()
+        if len(compress_prompts) < 4:
             return None
 
         # Only submit non-passthrough prompts to the sampler.
         sampler_input = [p for p in compress_prompts if p is not None]
         sampler_pos = [ri for ri, p in enumerate(compress_prompts) if p is not None]
         if sampler_input:
-            with retrainer.sampler_lock:
+            try:
                 sampler_responses = condenser_sampler.sample(sampler_input, compress_params)
+            except Exception as exc:
+                logger.warning(f'[sampler] error \u2192 API fallback: {exc}')
+                sampler_responses = [None] * len(sampler_input)
+                if 'Timeout' in type(exc).__name__:
+                    try:
+                        _rebuild_sampler()
+                    except Exception as re_exc:
+                        logger.error(f'[sampler] rebuild failed: {re_exc}')
         else:
             sampler_responses = []
+        _t_sample = time.monotonic()
+
         responses = [None] * len(compress_prompts)
         for resp, pos in zip(sampler_responses, sampler_pos):
             responses[pos] = resp
 
         # Extract decoded texts; detect truncations and fall back to API
-        decoded_texts: List[str] = []
+        decoded_texts: List[Optional[str]] = [None] * len(compress_prompts)
+        fallback_indices: List[int] = []
         for ri in range(len(compress_prompts)):
             if passthrough[ri] is not None:
-                decoded_texts.append(passthrough[ri])
+                decoded_texts[ri] = passthrough[ri]
                 continue
             resp = responses[ri]
             seq = resp.sequences[0] if resp and resp.sequences else None
@@ -638,27 +697,33 @@ def train():
                     text = text.replace(tok, '')
                 text = text.rstrip()
 
-            # Premature-EOS: model emits chat-template token mid-skeleton, vLLM reports
-            # stop_reason='stop' but the stripped text is structurally incomplete.
             needs_fallback = (not seq or seq.stop_reason == 'length'
-                              or _is_truncated_compression(text))
+                              or _is_truncated_compression(text, schemas[ri]))
             if not needs_fallback:
-                decoded_texts.append(text)
-                continue
-
-            api_result = _api_compress(api_client, compress_prompts[ri])
-            # Skip logging when the API itself produced truncated output: an incomplete
-            # gold answer would teach the condenser to imitate broken outputs.
-            if api_result and not _is_truncated_compression(api_result):
-                decoded_texts.append(api_result)
-                pair_idx = ri // 2
-                q_raw, c_raw = raw_pairs[pair_idx]
-                source_text = q_raw if ri % 2 == 0 else c_raw
-                _log_failure(source_text, prompt_queries[ri], api_result,
-                             valid_indices[pair_idx])
-                retrainer.notify_failure()
+                decoded_texts[ri] = text
             else:
-                decoded_texts.append('')
+                fallback_indices.append(ri)
+
+        _api_calls = len(fallback_indices)
+        if fallback_indices:
+            from concurrent.futures import as_completed
+            api_futures = {}
+            with ThreadPoolExecutor(max_workers=API_CONCURRENCY) as api_pool:
+                for ri in fallback_indices:
+                    api_futures[api_pool.submit(_api_compress, api_client, compress_prompts[ri])] = ri
+                for fut in as_completed(api_futures):
+                    ri = api_futures[fut]
+                    api_result = fut.result()
+                    if api_result and not _is_truncated_compression(api_result, schemas[ri]):
+                        decoded_texts[ri] = api_result
+                        pair_idx = ri // 2
+                        q_raw, c_raw = raw_pairs[pair_idx]
+                        source_text = q_raw if ri % 2 == 0 else c_raw
+                        _log_failure(source_text, prompt_queries[ri], api_result,
+                                     valid_indices[pair_idx])
+                    else:
+                        decoded_texts[ri] = ''
+        _t_api = time.monotonic()
 
         # Build embedding features from decoded texts
         emb_features: List[Dict[str, Any]] = []
@@ -673,69 +738,96 @@ def train():
             if feat_q and feat_c:
                 emb_features.append(feat_q)
                 emb_features.append(feat_c)
+        _t_feat = time.monotonic()
 
-        if len(emb_features) < 4:
-            return None
-        return emb_features
+        logger.info(
+            f'[prefetch] prompts={len(sampler_input)} api={_api_calls} feats={len(emb_features)} | '
+            f'build={_t_build - _t_enter:.1f}s '
+            f'vllm={_t_sample - _t_build:.1f}s '
+            f'api={_t_api - _t_sample:.1f}s feat={_t_feat - _t_api:.1f}s '
+            f'total={_t_feat - _t_enter:.1f}s')
+
+        _target = BATCH_SIZE * 2
+        minibatches = [emb_features[i:i + _target] for i in range(0, len(emb_features), _target)]
+        minibatches = [mb for mb in minibatches if len(mb) >= 4]
+        return minibatches if minibatches else None
 
     cur_step = RESUME_STEP
-    # Compute which epoch and how many batches to skip within that epoch
     _batches_per_epoch = len(dataloader)
-    _start_epoch = cur_step // _batches_per_epoch if cur_step > 0 else 0
-    _skip_batches_in_epoch = cur_step - _start_epoch * _batches_per_epoch if cur_step > 0 else 0
+    _steps_per_mega = PREFETCH_BATCH_MULTIPLIER
+    _start_epoch = cur_step // (_batches_per_epoch * _steps_per_mega) if cur_step > 0 else 0
+    _skip_batches_in_epoch = max(0, cur_step // _steps_per_mega - _start_epoch * _batches_per_epoch)
+
+    _ema_prefetch = 0.0
+    _ema_train = 0.0
+    _ema_alpha = 0.1
 
     prefetch_executor = ThreadPoolExecutor(max_workers=1)
     for epoch in range(_start_epoch, NUM_EPOCHS):
-        # Skip consumed samples for the resume epoch (shuffle order won't match
-        # exactly, but the correct number of samples is skipped).
         if _skip_batches_in_epoch > 0:
-            dataloader.skip_consumed_samples(_skip_batches_in_epoch * BATCH_SIZE)
+            dataloader.skip_consumed_samples(_skip_batches_in_epoch * _mega_batch_size)
         batch_iter = iter(dataloader)
-        # Reset skip after first resumed epoch
         _skip_batches_in_epoch = 0
-        prefetch_future = None
-        first_batch = next(batch_iter, None)
-        if first_batch is not None:
-            prefetch_future = prefetch_executor.submit(_sample_batch, first_batch)
 
-        for raw_batch in batch_iter:
-            emb_features = prefetch_future.result() if prefetch_future else None
-            prefetch_future = prefetch_executor.submit(_sample_batch, raw_batch)
+        first = next(batch_iter, None)
+        future = prefetch_executor.submit(_sample_batch, first) if first else None
 
-            if emb_features is None:
+        for raw_mega_batch in batch_iter:
+            t0 = time.monotonic()
+            minibatches = future.result() if future else None
+            t_prefetch = time.monotonic() - t0
+            future = prefetch_executor.submit(_sample_batch, raw_mega_batch)
+
+            if not minibatches:
                 continue
 
-            model.forward_backward(inputs=emb_features, task='embedding')
-            model.clip_grad_and_step(gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
-            cur_step += 1
+            for mb in minibatches:
+                t1 = time.monotonic()
+                model.forward_backward(inputs=mb, task='embedding')
+                model.clip_grad_and_step(gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+                t_train = time.monotonic() - t1
+                cur_step += 1
 
-            if cur_step % LOG_INTERVAL == 0:
-                metric = model.calculate_metric(is_training=True)
-                logger.info(
-                    f'Epoch {epoch} Step {cur_step}/{total_forward_steps}, metric: {metric}')
-                log_dict = {}
-                for k, v in metric.items():
-                    if not v:
-                        continue
-                    try:
-                        log_dict[k] = float(v)
-                    except (ValueError, TypeError):
-                        pass
-                log_dict['epoch'] = epoch
-                swanlab.log(log_dict, step=cur_step)
-            if cur_step % SAVE_INTERVAL == 0:
-                save_checkpoint(model, f'step_{cur_step}')
+                _ema_prefetch = _ema_alpha * t_prefetch + (1 - _ema_alpha) * _ema_prefetch if cur_step > RESUME_STEP + 1 else t_prefetch
+                _ema_train = _ema_alpha * t_train + (1 - _ema_alpha) * _ema_train if cur_step > RESUME_STEP + 1 else t_train
 
-        # # Drain last prefetched batch
-        # if prefetch_future is not None:
-        #     emb_features = prefetch_future.result()
-        #     if emb_features is not None:
-        #         model.forward_backward(inputs=emb_features, task='embedding')
-        #         model.clip_grad_and_step()
-        #         cur_step += 1
+                if cur_step % LOG_INTERVAL == 0:
+                    metric = model.calculate_metric(is_training=True)
+                    _bottleneck = 'PREFETCH' if _ema_prefetch > _ema_train else 'TRAIN'
+                    logger.info(
+                        f'Epoch {epoch} Step {cur_step}/{total_forward_steps}, metric: {metric} | '
+                        f'prefetch={t_prefetch:.1f}s(ema {_ema_prefetch:.1f}) '
+                        f'train={t_train:.1f}s(ema {_ema_train:.1f}) '
+                        f'bottleneck={_bottleneck}')
+                    log_dict = {}
+                    for k, v in metric.items():
+                        if not v:
+                            continue
+                        try:
+                            log_dict[k] = float(v)
+                        except (ValueError, TypeError):
+                            pass
+                    log_dict['epoch'] = epoch
+                    log_dict['prefetch_sec'] = round(t_prefetch, 2)
+                    log_dict['train_sec'] = round(t_train, 2)
+                    swanlab.log(log_dict, step=cur_step)
+                if cur_step % SAVE_INTERVAL == 0:
+                    save_checkpoint(model, f'step_{cur_step}')
+                t_prefetch = 0.0
+
+        # Drain final mega-batch
+        if future:
+            minibatches = future.result()
+            future = None
+            if minibatches:
+                for mb in minibatches:
+                    model.forward_backward(inputs=mb, task='embedding')
+                    model.clip_grad_and_step(gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS)
+                    cur_step += 1
+                    if cur_step % SAVE_INTERVAL == 0:
+                        save_checkpoint(model, f'step_{cur_step}')
 
     prefetch_executor.shutdown(wait=False)
-    retrainer.stop()
     save_checkpoint(model, 'last-checkpoint')
 
 

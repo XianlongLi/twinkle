@@ -312,6 +312,19 @@ pip install torch_npu-2.7.1-cp311-cp311-linux_aarch64.whl
 2. “待验证”功能可以尝试，但可能遇到兼容性问题
 3. 遇到问题时，参考对应的示例代码进行配置
 
+## 示例代码
+
+Twinkle 在 NPU 上已验证的示例目前聚焦 Megatron smoke 路径；SFT 和 GRPO cookbook 示例暂无对应文件。
+
+### 远程训练（Tinker 协议）
+- **服务端配置**：[cookbook/remote/tinker/ascend/](https://github.com/modelscope/twinkle/tree/main/cookbook/remote/tinker/ascend)
+  - 提供 HTTP API 接口
+  - 支持远程训练和推理
+  - 适用于生产环境部署
+
+**运行示例**：
+暂无对应命令示例。
+
 
 ## 参考资源
 
