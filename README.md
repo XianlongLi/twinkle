@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
+        <a href="https://modelscope.github.io/twinkle-web/docs/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/zh/docs/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle Web</a> &nbsp
 </p>
 
 ## ✨ What is Twinkle?
@@ -61,7 +61,7 @@ pip install -e .
 ### Use our docker image：
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
 ```
 
 If you need to use Twinkle's Client, you can use our one-click installation script:
@@ -100,11 +100,11 @@ sh INSTALL_MEGATRON.sh
 | DPO multi-LoRA training              | transformers    | [Script](cookbook/rl/dpo_multi_lora.py)                |
 | GKD on-policy distillation           | megatron        | [Script](cookbook/rl/gkd_on_policy.py)                 |
 | GKD off-policy distillation          | megatron        | [Script](cookbook/rl/gkd_off_policy.py)                |
-| Tinker client finetuning (self-host) | transformers    | [Script](cookbook/client/tinker/self_host)             |
-| Tinker client finetuning (ModelScope) | transformers   | [Script](cookbook/client/tinker/modelscope)            |
-| Twinkle client finetuning (self-host) | transformers   | [Script](cookbook/client/twinkle/self_host)            |
-| Twinkle client finetuning (ModelScope) | transformers  | [Script](cookbook/client/twinkle/modelscope)           |
-| Server startup scripts               | transformers/megatron | [Script](cookbook/client/server)                 |
+| Tinker client finetuning (self-host) | transformers    | [Script](cookbook/server_mode/tinker/self_host)             |
+| Tinker client finetuning (ModelScope) | transformers   | [Script](cookbook/server_mode/tinker/modelscope)            |
+| Twinkle client finetuning (self-host) | transformers   | [Script](cookbook/server_mode/twinkle/self_host)            |
+| Twinkle client finetuning (ModelScope) | transformers  | [Script](cookbook/server_mode/twinkle/modelscope)           |
+| Server startup scripts               | transformers/megatron | [Script](cookbook/server_mode/server)                 |
 
 ## Changelog
 - 🎉2026-05-20 Support DeepSeek-V4-Flash and DeepSeek-V4-Pro models.
@@ -122,14 +122,14 @@ sh INSTALL_MEGATRON.sh
 
 We are rolling out training service built atop Twinkle✨ on ModelScope. You may
 train via API endpoint  `base_url=https://www.modelscope.cn/twinkle`. For more details, please refer to
-our [documentation](docs/source_en/Usage%20Guide/Train-as-a-Service.md).
+our [documentation](https://modelscope.github.io/twinkle-web/docs/usage-guide/train-as-a-service/).
 
 ## Supported Hardware
 
 | Hardware Environment | Notes                                                            |
 | -------------------- | ---------------------------------------------------------------- |
 | Nvidia GPUs          | ✅ Support for BF16/Flash-Attn may be incomplete in earlier GPUs |
-| Ascend NPU           | ✅ Some operators may not be supported                           |
+| Ascend NPU           | ✅ FP8 is not supported on A2 and A3 due to hardware limitations |
 | PPU                  | ✅                                                               |
 | CPU                  | Supports partial components like dataset, dataloader             |
 
@@ -177,7 +177,7 @@ supported on Twinkle✨ framework.
 ## Sample Code
 
 Below are some of the capabilities demonstrated in the example code. For a complete introduction to training capabilities,
-please refer to [Quick Start](docs/source_en/Usage%20Guide/Quick-Start.md) and [cookbook](cookbook).
+please refer to [Quick Start](https://modelscope.github.io/twinkle-web/docs/usage-guide/quick-start/) and [cookbook](cookbook).
 
 ### Train with Ray
 

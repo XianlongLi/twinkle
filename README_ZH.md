@@ -19,7 +19,7 @@ by <a href="https://modelscope.cn/home">ModelScope</a> & <a href="https://www.cm
 </p>
 
 <p align="center">
-        <a href="https://twinkle-kit.readthedocs.io/en/latest/">英文文档</a> &nbsp ｜ &nbsp <a href="https://twinkle-kit.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle 站点</a> &nbsp
+        <a href="https://modelscope.github.io/twinkle-web/docs/">英文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/zh/docs/">中文文档</a> &nbsp ｜ &nbsp <a href="https://modelscope.github.io/twinkle-web/">Twinkle 站点</a> &nbsp
 </p>
 
 ## ✨ Twinkle 是什么？
@@ -54,7 +54,7 @@ pip install -e .
 ### 使用docker镜像：
 
 ```text
-modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.2.1
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/modelscope:twinkle-0.3.0
 ```
 
 如果你需要使用Twinkle的Client，可以使用我们的一键安装脚本：
@@ -94,13 +94,13 @@ sh INSTALL_MEGATRON.sh
 | DPO 多 LoRA 训练                    | transformers          | [脚本](cookbook/rl/dpo_multi_lora.py)                  |
 | GKD 在线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_on_policy.py)                   |
 | GKD 离线蒸馏                        | megatron              | [脚本](cookbook/rl/gkd_off_policy.py)                  |
-| Tinker 客户端微调（自部署）         | transformers          | [脚本](cookbook/client/tinker/self_host)               |
-| Tinker 客户端微调（ModelScope）      | transformers          | [脚本](cookbook/client/tinker/modelscope)              |
-| Twinkle 客户端微调（自部署）        | transformers          | [脚本](cookbook/client/twinkle/self_host)              |
-| Twinkle 客户端微调（ModelScope）     | transformers          | [脚本](cookbook/client/twinkle/modelscope)             |
-| 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/client/server)                         |
+| Tinker 客户端微调（自部署）         | transformers          | [脚本](cookbook/server_mode/tinker/self_host)               |
+| Tinker 客户端微调（ModelScope）      | transformers          | [脚本](cookbook/server_mode/tinker/modelscope)              |
+| Twinkle 客户端微调（自部署）        | transformers          | [脚本](cookbook/server_mode/twinkle/self_host)              |
+| Twinkle 客户端微调（ModelScope）     | transformers          | [脚本](cookbook/server_mode/twinkle/modelscope)             |
+| 服务端启动脚本                      | transformers/megatron | [脚本](cookbook/server_mode/server)                         |
 
-Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](docs/source_zh/使用指引/快速开始.md)
+Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Client等各场景下。其算法过程是外露的，非常便于修改和调试。完整的框架介绍请查看[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)
 
 ## 更新日志
 - 🎉2026-05-20 支持DeepSeek-V4-Flash and DeepSeek-V4-Pro系列模型。
@@ -116,14 +116,14 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 
 ## ModelScope 的训练服务
 
-我们正在 ModelScope 上推出基于 Twinkle✨ 构建的训练服务。你可以通过 API 端点 `base_url=https://www.modelscope.cn/twinkle` 进行训练。更多详情请参阅我们的[文档](docs/source_zh/使用指引/训练服务.md)。
+我们正在 ModelScope 上推出基于 Twinkle✨ 构建的训练服务。你可以通过 API 端点 `base_url=https://www.modelscope.cn/twinkle` 进行训练。更多详情请参阅我们的[文档](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/train-as-a-service/)。
 
 ## 支持的硬件
 
 | 硬件环境 | 备注                                                            |
 | -------- | --------------------------------------------------------------- |
 | Nvidia GPU | ✅ 早期 GPU 对 BF16/Flash-Attn 的支持可能不完整 |
-| 昇腾 NPU   | ✅ 部分算子可能不支持                              |
+| 昇腾 NPU   | ✅ 由于硬件限制A2、A3暂不支持FP8                              |
 | PPU        | ✅                                                               |
 | CPU        | 支持部分组件如 dataset、dataloader             |
 
@@ -166,7 +166,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 
 ## 示例代码
 
-下面列出了示例代码的一部分能力。完整的训练能力介绍请参考[快速开始](docs/source_zh/使用指引/快速开始.md)以及[cookbook](cookbook)。
+下面列出了示例代码的一部分能力。完整的训练能力介绍请参考[快速开始](https://modelscope.github.io/twinkle-web/zh/docs/usage-guide/quick-start/)以及[cookbook](cookbook)。
 
 ### 使用 Ray 训练
 

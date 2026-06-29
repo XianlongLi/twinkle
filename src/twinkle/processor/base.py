@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -30,6 +33,7 @@ class InputProcessor:
         'inputs_embeds': 0.0,
         'attention_mask': 0,
         'labels': -100,
+        'completion_mask': 0,
         'loss_scale': 0.0,
         'position_ids': -1,
         'length': -1,
@@ -39,7 +43,6 @@ class InputProcessor:
         'video_grid_thw': 0,
         'input_features': 0.0,
         'feature_attention_mask': 0,
-        'mm_token_type_ids': 0,
         'routed_experts': 0,
     }
 
@@ -91,7 +94,7 @@ class InputProcessor:
             return inputs[0]
         else:
             for _input in inputs:
-                if 'position_ids' in _input and _input['position_ids'].dim() > 2:
+                if 'position_ids' in _input and _input['position_ids'] is not None and _input['position_ids'].dim() > 2:
                     # megatron needs 3, 1, N
                     _input['position_ids'] = _input['position_ids'][1:]
             return inputs
@@ -107,8 +110,11 @@ class InputProcessor:
                 # so tensor ops like labels != ignore_index or .to(device) would fail without this.
                 if isinstance(value, np.ndarray):
                     value = torch.from_numpy(value)
-                elif (isinstance(value, list) and isinstance(value[0],
-                                                             (int, float, np.number))) or key == 'position_ids':
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
+                    value = torch.tensor(value)
+                elif key == 'position_ids' and not isinstance(value, torch.Tensor):
+                    if value is None:
+                        continue
                     value = torch.tensor(value)
                 elif (isinstance(value, list)) and key in ('completion_mask', 'mm_token_type_ids', 'routed_experts'):
                     value = torch.tensor(value)
@@ -145,10 +151,107 @@ class InputProcessor:
         After this call, logps and labels are in per-sequence batch format
         ``[num_sequences, max_seq_len]`` when the input was packed, or left
         unchanged for normal (non-packed) batches.
+
+        For ``task='embedding'`` this also performs the last-valid-token
+        pooling (with padding-free / SP gather awareness) and writes the
+        pooled ``[n_seqs, H]`` tensor to ``outputs['embeddings']``; the raw
+        per-token ``outputs['features']`` is consumed and removed.
         """
         sp_strategy = kwargs.get('sp_strategy')
+        task = kwargs.get('task', 'causal_lm')
+        if task == 'embedding':
+            return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
         if self.framework == 'transformers' and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
+        return inputs, outputs
+
+    @staticmethod
+    def _packed_last_indices(position_ids: torch.Tensor, total_len: int) -> torch.Tensor:
+        """For padding-free batches: per-segment last-token indices into a [1, total] sequence."""
+        flat = position_ids.squeeze(0) if position_ids.dim() == 2 else position_ids
+        starts = (flat == 0).nonzero(as_tuple=False).squeeze(-1)
+        end_anchor = torch.tensor([total_len], device=flat.device, dtype=starts.dtype)
+        boundaries = torch.cat([starts, end_anchor])
+        return (boundaries[1:] - 1).long()
+
+    def _postprocess_embedding(self,
+                               inputs: Dict[str, Any],
+                               outputs: Dict[str, Any],
+                               sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Pool per-token features to per-sequence embeddings (last-valid-token).
+
+        Build a one-hot end-token mask in the un-padded global frame, route it
+        through the same pad+split as ``input_ids`` so it aligns with local
+        features, pool locally, then ``all_reduce`` only the ``[n_seqs, H]``
+        tensor across SP × RP. No feature gather; uniform across
+        DP / Ulysses / zigzag-ring / padding-free.
+        """
+        features = outputs.get('features')
+        assert features is not None, (
+            "outputs['features'] missing; ensure TransformersEmbeddingPatch is applied for task='embedding'.")
+
+        sp_enabled = (
+            self.framework == 'transformers' and sp_strategy is not None and getattr(sp_strategy, 'enabled', False)
+            and getattr(sp_strategy, 'world_size', 1) > 1)
+
+        ref_pos = sp_strategy.real_position_ids if sp_enabled else inputs['position_ids']
+        if ref_pos.dim() == 3:
+            ref_pos = ref_pos[0]
+        # Accept both flash-attn (cu_seq_lens_q) and Megatron (cu_seqlens_q) conventions.
+        cu_seq_lens_q = inputs.get('cu_seq_lens_q', inputs.get('cu_seqlens_q'))
+
+        is_packed = (
+            features.shape[0] == 1 and (cu_seq_lens_q is not None or int((ref_pos.reshape(-1) == 0).sum()) > 1))
+
+        device, dtype = features.device, features.dtype
+        T_real = ref_pos.shape[-1]
+
+        if is_packed:
+            if torch.is_tensor(cu_seq_lens_q) and cu_seq_lens_q.numel() >= 2:
+                end_idx = (cu_seq_lens_q[1:].long() - 1).to(device)
+            else:
+                end_idx = self._packed_last_indices(ref_pos, T_real).to(device)
+            n_seqs = end_idx.shape[0]
+            batch_idx = torch.zeros_like(end_idx)
+            target_idx = torch.arange(n_seqs, device=device)
+            B_mask, n_targets = 1, n_seqs
+        else:
+            n_seqs = ref_pos.shape[0]
+            # clamp_min(0) prevents negative indexing when a row is fully padded (sum == 0).
+            end_idx = ((ref_pos >= 0).long().sum(-1) - 1).clamp_min(0)
+            batch_idx = torch.arange(n_seqs, device=device)
+            target_idx = torch.zeros(n_seqs, dtype=torch.long, device=device)
+            B_mask, n_targets = n_seqs, 1
+
+        mask = torch.zeros(B_mask, T_real, n_targets, dtype=dtype, device=device)
+        mask[batch_idx, end_idx, target_idx] = 1.0
+
+        if sp_enabled:
+            # Route mask through the same pad+split as input_ids to align with local features.
+            rp = sp_strategy.real_position_ids
+            rp_padded = sp_strategy.pad(rp, padding_value=-1, position_ids=rp, dim=-1)
+            mask = sp_strategy.pad(mask, padding_value=0, position_ids=rp, dim=1)
+            mask = sp_strategy.split(mask, dim=1, position_ids=rp_padded)
+
+        assert mask.shape[1] == features.shape[1], (
+            f'mask seq-dim {mask.shape[1]} != features seq-dim {features.shape[1]}; '
+            'sp_strategy.split contract broken or T_real mismatched.')
+
+        embeddings = torch.einsum('bth,btn->bnh', features, mask)
+        embeddings = embeddings.squeeze(0) if is_packed else embeddings.squeeze(1)
+
+        if sp_enabled and dist.is_available() and dist.is_initialized():
+            for grp_attr, size_attr in (('_sp_group', 'sp_world_size'), ('_rp_group', 'rp_world_size')):
+                grp = getattr(sp_strategy, grp_attr, None)
+                if grp is not None and getattr(sp_strategy, size_attr, 1) > 1:
+                    dist.all_reduce(embeddings, op=dist.ReduceOp.SUM, group=grp)
+
+        # Normalize after pool+reduce so swapping pooling strategy (last/mean/CLS) stays mathematically correct.
+        embeddings = F.normalize(embeddings, p=2, dim=-1)
+
+        outputs = copy(outputs)
+        outputs.pop('features', None)
+        outputs['embeddings'] = embeddings.contiguous()
         return inputs, outputs
 
     def pad_cp(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
@@ -186,7 +289,9 @@ class InputProcessor:
                 return input_tensor
 
             if cp_size > 1:
-                position_ids_f = position_ids.flatten()
+                pos_for_cu = position_ids[:1] if position_ids.dim() >= 2 and position_ids.shape[0] > 1 \
+                    else position_ids
+                position_ids_f = pos_for_cu.flatten()
                 indices_q = torch.arange(position_ids_f.shape[0], device=position_ids_f.device, dtype=torch.int32)
                 cu_seqlens = torch.cat([
                     indices_q[position_ids_f == 0],
@@ -256,8 +361,11 @@ class InputProcessor:
                     view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] //
                                   (2 * cp_size), *inputs.shape[dim + 1:])
                     val = val.view(view_shape)
-                    index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
-                                         pin_memory=True).cuda(non_blocking=True)
+                    index = torch.tensor(
+                        [cp_rank, (2 * cp_size - cp_rank - 1)],
+                        device=inputs.device,
+                        dtype=torch.long,
+                    )
                     val = val.index_select(dim, index)
                     view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
                     new_inputs.append(val.view(view_shape))
@@ -265,7 +373,7 @@ class InputProcessor:
 
             if cp_size > 1:
                 input_ids = split_cp_inputs(input_ids, cu_seqlens_q, dim=1)
-                position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=1)
+                position_ids = split_cp_inputs(position_ids, cu_seqlens_q, dim=-1)
                 # attention_mask = split_cp_inputs(attention_mask, cu_seqlens_q, dim=1)
                 batch_labels = split_cp_inputs(batch_labels, cu_seqlens_q, dim=1)
 
@@ -302,17 +410,18 @@ class InputProcessor:
         if not padding_free or bool(kwargs.get('enable_sp', False)):
             return inputs
 
-        from twinkle.patch import apply_patch
-        from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
-
-        apply_patch(
-            model,
-            GatedDeltaNetPaddingFreePatch,
-            hf_config=kwargs.get('hf_config'),
-            enable_sp=False,
-        )
         if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-            return inputs
+            from twinkle.patch import apply_patch
+            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
+
+            apply_patch(
+                model,
+                GatedDeltaNetPaddingFreePatch,
+                hf_config=kwargs.get('hf_config'),
+                enable_sp=False,
+            )
+            if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
+                return inputs
 
         for _inp in inputs:
             position_ids = _inp.get('position_ids')
@@ -343,7 +452,7 @@ class InputProcessor:
     def _pad_sequence(sequences, padding_value, padding_side, concat=None):
         if padding_side == 'right':
             from twinkle.utils import pad_and_stack_tensors
-            return pad_and_stack_tensors(sequences, pad_value=padding_value, 
+            return pad_and_stack_tensors(sequences, pad_value=padding_value,
                                          concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
@@ -472,6 +581,7 @@ class InputProcessor:
         self,
         inputs: Dict[str, Any],
         outputs: Optional[Dict[str, Any]] = None,
+        task: str = 'causal_lm',
     ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         """Unpack packed (padding_free) sequences into per-sequence batch format.
 
@@ -479,7 +589,12 @@ class InputProcessor:
         Unpacks ``labels`` and any present output keys (``logps``, ``logits``)
         from ``[1, total_tokens, ...]`` to ``[num_sequences, max_seq_len, ...]``.
         Keys that are ``None`` are silently skipped.
+
+        For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
+        by ``postprocess_tensor_sp``, so this is a no-op.
         """
+        if task == 'embedding':
+            return inputs, outputs
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')
 
@@ -510,9 +625,13 @@ class InputProcessor:
 
         return inputs, outputs
 
-    def unpack_inputs(self, inputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Unpack a list of packed microbatch inputs into per-sequence format."""
-        return [self.unpack_packed_sequences(inp)[0] for inp in inputs]
+    def unpack_inputs(self, inputs: List[Dict[str, Any]], task: str = 'causal_lm') -> List[Dict[str, Any]]:
+        """Unpack a list of packed microbatch inputs into per-sequence format.
+
+        For ``task='embedding'`` this is a no-op since embedding outputs are
+        already pooled to ``[n_seqs, H]`` upstream.
+        """
+        return [self.unpack_packed_sequences(inp, task=task)[0] for inp in inputs]
 
     @staticmethod
     def to_transformers_dict(inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
@@ -522,16 +641,28 @@ class InputProcessor:
             output = {}
             _keys = [
                 'input_ids',
-                'input_embeddings',
+                'inputs_embeds',
                 'attention_mask',
                 'position_ids',
                 'labels',
                 'completion_mask',
+                'cu_seq_lens_q',
+                'cu_seq_lens_k',
+                'cu_seqlens_q',
+                'cu_seqlens_kv',
+                'max_length_q',
+                'max_length_k',
+                'packed_seq_params',
                 'routed_experts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
             for key in list(_input.keys()):
-                if key in _keys:
-                    output[key] = np.array(_input[key]) if not isinstance(_input[key], torch.Tensor) else _input[key]
+                if key not in _keys:
+                    continue
+                value = _input[key]
+                if isinstance(value, torch.Tensor) or not isinstance(value, (list, np.ndarray)):
+                    output[key] = value
+                else:
+                    output[key] = np.array(value)
             results.append(InputFeature(**output))
         return results
 
@@ -586,7 +717,8 @@ class InputProcessor:
                     result[key] = self._create_4d_attention_mask(values)
                 elif key == 'position_ids' and is_mm_position_ids(values[0]):
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side)
-                    result[key] = result[key].reshape(values[0].shape[0], len(values), -1)
+                    num_axes = values[0].shape[0]
+                    result[key] = result[key].reshape(len(values), num_axes, -1).permute(1, 0, 2).contiguous()
                 elif isinstance(values[0], torch.Tensor):
                     concat = False if (key == 'routed_experts') else None
                     result[key] = InputProcessor._pad_sequence(values, self.padding_map[key], self.padding_side, concat)
@@ -658,51 +790,21 @@ class InputProcessor:
                 outputs.append(output)
             return outputs
 
-    def postprocess_tensor_cp(self, tensor):
-        """All-gather and reconstruct full sequence from CP-split tensor.
+    def postprocess_tensor_cp(self, tensor, cu_seqlens=None):
+        """All-gather and reconstruct full sequence from a CP load-balanced shard.
 
-        Uses load-balanced split pattern: each CP rank holds chunks [rank] and
-        [2*cp_size - rank - 1] from the original 2*cp_size chunks.
-
-        Only the current rank's slice retains the original tensor (and its
-        gradient graph); other ranks' slices are plain copies.  This means
-        backward through the reconstructed tensor only produces gradients for
-        the local chunk, naturally distributing the gradient across CP ranks
-        without extra scaling.
-
-        Args:
-            tensor: [batch_size, seq_len/cp_size] CP-split tensor
-
-        Returns:
-            [batch_size, full_seq_len] reconstructed full tensor
+        Thin wrapper over :func:`twinkle.utils.torch_utils.gather_cp_load_balanced`
+        that resolves the CP group via Megatron's ``parallel_state``. Pass
+        ``cu_seqlens`` (full-sequence pre-split boundaries, e.g. from
+        ``packed_seq_params.cu_seqlens_q``) for multi-segment packed batches.
         """
         if self.device_mesh.cp_world_size <= 1:
             return tensor
-
         from megatron.core import parallel_state as mpu
-        cp_size = mpu.get_context_parallel_world_size()
-        cp_rank = mpu.get_context_parallel_rank()
-        cp_group = mpu.get_context_parallel_group()
 
-        gathered = [torch.empty_like(tensor) for _ in range(cp_size)]
-        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
-        gathered[cp_rank] = tensor
+        from twinkle.utils.torch_utils import gather_cp_load_balanced
+        return gather_cp_load_balanced(tensor, mpu.get_context_parallel_group(), seq_dim=1, cu_seqlens=cu_seqlens)
 
-        batch_size = tensor.shape[0]
-        seq_len_per_cp = tensor.shape[1]
-        full_seq_len = seq_len_per_cp * cp_size
-        chunk_len = full_seq_len // (2 * cp_size)
-        half_len = seq_len_per_cp // 2
-
-        output = tensor.new_zeros(batch_size, full_seq_len)
-        for j in range(cp_size):
-            o = gathered[j]
-            output[:, j * chunk_len:(j + 1) * chunk_len] = o[:, :half_len]
-            reverse_idx = 2 * cp_size - j - 1
-            output[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o[:, half_len:]
-
-        return output
-    
     def align_routed_experts(self, inputs: Union[List[InputFeature], InputFeature], **kwargs) -> List[InputFeature]:
 
         def align_to(_input):

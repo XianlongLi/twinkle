@@ -161,18 +161,23 @@ class RayHelper:
         return ip, port
 
     @staticmethod
-    def do_get_and_collect_func(collect_func: Callable, method: Union[str, Callable], futures, device_mesh):
+    def do_get_and_collect_func(collect_func: Callable,
+                                method: Union[str, Callable],
+                                futures,
+                                device_mesh,
+                                timeout=None):
         """Return a callable to collect results in the workers."""
 
         class LazyCollect:
 
-            def __init__(self, futures, method, collect_func, device_mesh):
+            def __init__(self, futures, method, collect_func, device_mesh, timeout=None):
                 self._futures = futures
                 self._method = method
                 self._collect_func = collect_func
                 self._is_lazy_collect = True
                 self.device_mesh = device_mesh
                 self._result = None  # Cache collected results
+                self._timeout = timeout
 
             def _get_result(self):
                 """Internal method to lazily collect and cache results"""
@@ -181,7 +186,7 @@ class RayHelper:
                     result = []
                     for future in self._futures:
                         if isinstance(future, ray.ObjectRef):
-                            result.append(ray.get(future))
+                            result.append(ray.get(future, timeout=self._timeout))
                         else:
                             result.append(future)
                     self._result = self._collect_func(self._method, result, device_mesh=self.device_mesh)
@@ -199,7 +204,7 @@ class RayHelper:
                 """Support len() function"""
                 return len(self._get_result())
 
-        return LazyCollect(futures, method, collect_func, device_mesh)
+        return LazyCollect(futures, method, collect_func, device_mesh, timeout=timeout)
 
     @staticmethod
     def do_get_and_collect(args, kwargs):
@@ -339,6 +344,9 @@ class RayHelper:
                 worker_name = key + '-' + str(rank)
                 env_vars = os.environ.copy()
                 env_vars.update({
+                    'WORLD_SIZE': str(world_size),
+                    'RANK': str(rank),
+                    'LOCAL_RANK': str(0),
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',

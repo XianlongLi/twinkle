@@ -4,6 +4,7 @@ import inspect
 import json
 import numpy as np
 import os
+import sys
 from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
@@ -34,6 +35,30 @@ _notifier: Optional[Any] = None
 _name: Optional[str] = None
 
 _TWINKLE_NOTIFIER_ENV = 'TWINKLE_NOTIFIER'
+
+
+def _capture_caller() -> Optional[str]:
+    """Return ``file:line`` of the first frame outside this module, or ``None``."""
+    f = sys._getframe(1)
+    while f and f.f_code.co_filename == __file__:
+        f = f.f_back
+    return f'{f.f_code.co_filename}:{f.f_lineno}' if f else None
+
+
+def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
+    """Stamp driver-caller location onto exc for both traceback and str(exc)."""
+    if not caller:
+        return
+    try:
+        marker = f'[twinkle] driver caller: {caller}'
+        if marker not in (getattr(exc, '__notes__', None) or []):
+            exc.add_note(marker)
+        if not getattr(exc, '_twinkle_caller_augmented', False):
+            prefix = f'[twinkle driver caller: {caller}] '
+            exc.args = (prefix + str(exc.args[0]), *exc.args[1:]) if exc.args else (prefix.rstrip(), )
+            exc._twinkle_caller_augmented = True
+    except Exception:  # noqa
+        pass
 
 
 def _maybe_load_worker_notifier() -> None:
@@ -377,6 +402,7 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
 
         return result
     elif dispatch == 'slice_dp':
+        assert device_mesh is not None
         # split by dp. each worker in one ep will receive the same argument
         result = []
         # if device_mesh is not None:
@@ -384,13 +410,18 @@ def _dispatch_args(workers, dispatch, execute, device_mesh: Optional[DeviceMesh]
         # Comment this because remote_class supports `first``
         # assert device_mesh.world_size == len(workers)
         length = len(workers)
+        # Map actor index to global_rank: with gpus_per_worker>1, consecutive
+        # global ranks belong to the same actor (TP peers).
+        _mesh_world = device_mesh.world_size if device_mesh is not None else length
+        _rank_stride = max(1, _mesh_world // length)
 
         def dispatch_func(arg, n):
             import torch
             if isinstance(arg, list) or isinstance(arg, torch.Tensor):
                 _args = []
                 for i in range(n):
-                    _args.append(arg[device_mesh.get_slice(len(arg), device_mesh.get_data_rank_from_global_rank(i))])
+                    _args.append(arg[device_mesh.get_slice(
+                        len(arg), device_mesh.get_data_rank_from_global_rank(i * _rank_stride))])
                 return _args
             elif isinstance(arg, dict):
                 _args = [{} for _ in range(n)]
@@ -487,15 +518,19 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
 
         @functools.wraps(init_method)
         def new_init(self, *args, **kwargs):
+            _caller = _capture_caller()
             _ctx = f'{cls.__name__}.__init__'
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 _maybe_load_worker_notifier()
-                _new_init_body(self, *args, **kwargs)
+                _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:  # noqa: BLE001
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 
-        def _new_init_body(self, *args, **kwargs):
+        def _new_init_body(self, _caller, *args, **kwargs):
             if _mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -519,10 +554,11 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
                 from ._ray import RayHelper
 
                 # In case the same class created twice in the same device group
-                # Try to get the caller's line
-                frame = inspect.currentframe().f_back
-                caller_file = frame.f_code.co_filename.replace(os.sep, '_').replace('.', '_')
-                caller_line = frame.f_lineno
+                # Try to get the caller's line (resolved in ``new_init`` so it points
+                # at user code, not at the wrapper itself).
+                _cf, _, _cl = (_caller or f'{__file__}:0').rpartition(':')
+                caller_file = _cf.replace(os.sep, '_').replace('.', '_')
+                caller_line = _cl
                 # Pass an instance_id is recommended
                 instance_id = kwargs.pop('instance_id', '') + f'{caller_file}_{caller_line}'
                 remote_group = kwargs.get('remote_group')
@@ -651,11 +687,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all'):
     return decorator
 
 
-def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callable] = 'slice',
+def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
                     sync: bool = False,
-                    lazy_collect: Optional[bool] = None):
+                    lazy_collect: Optional[bool] = None,
+                    timeout: Optional[float] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
     Args:
@@ -681,6 +718,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         sync: If True, use synchronous execution (execute_all_sync) instead of async.
             Required for methods with NCCL collective operations (e.g., Megatron forward_backward).
         lazy_collect: Do lazy collect, this boolean value decides whether this function needs lazy collect. If setting to None, it will follow the global setting.
+        timeout: Timeout in seconds for ray.get() when collecting results. Instance attribute ``_ray_get_timeout`` overrides this.
     """ # noqa
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
@@ -688,6 +726,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
             _ctx = f'{type(self).__name__}.{func.__name__}'
+            # Only capture caller on driver side; worker frames are Ray internals
+            _caller = _capture_caller() if hasattr(self, '_actors') else None
+            if _caller:
+                _ctx = f'{_ctx} <- {_caller}'
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
                 if _mode == 'local':
@@ -724,7 +766,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
 
                         result = execute_method(func.__name__, _workers_and_args)
                         # This is a result future, call it to get the actual result
-                        result_func = RayHelper.do_get_and_collect_func(_collect_func, collect, result, device_mesh)
+                        _rgt = getattr(self, '_ray_get_timeout', None) or timeout
+                        result_func = RayHelper.do_get_and_collect_func(
+                            _collect_func, collect, result, device_mesh, timeout=_rgt)
                         _local_lazy_collect = _lazy_collect
                         if func.__name__ == '__iter__':
                             # return self
@@ -754,18 +798,14 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
                             # And this is user independent, only decided by the code.
                             _local_lazy_collect = self._lazy_collect
                         if _local_lazy_collect:
-                            # Wrap the deferred collector so that exceptions
-                            # raised when the caller later materializes the
-                            # result also trigger the notifier. Attributes
-                            # (``_futures`` etc.) on the original collector
-                            # are preserved for downstream code paths.
                             _orig_result_func = result_func
 
                             @functools.wraps(_orig_result_func)
                             def _notifying_result_func(*rargs, **rkwargs):
                                 try:
                                     return _orig_result_func(*rargs, **rkwargs)
-                                except Exception as _e:  # noqa: BLE001
+                                except Exception as _e:  # noqa
+                                    _tag_exc(_e, _caller)
                                     notify_exception(_notifier, _ctx, _e, _name)
                                     raise
 
@@ -779,6 +819,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp'], Callabl
             except StopIteration:
                 raise
             except Exception as _e:  # noqa: BLE001
+                _tag_exc(_e, _caller)
                 notify_exception(_notifier, _ctx, _e, _name)
                 raise
 

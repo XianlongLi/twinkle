@@ -1,11 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from twinkle.data_format import InputFeature
 
-StopReason = Literal['length', 'stop']
+StopReason = Literal['length', 'stop', 'abort', 'error']
 
 
 @dataclass

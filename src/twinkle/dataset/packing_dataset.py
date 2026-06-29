@@ -114,10 +114,14 @@ class PackingDataset(Dataset):
         assert self._packed_called, 'Call `pack_dataset()` first before index the sample.'
         sequence = self.packed_idx[index]
         rows = [self.dataset[i] for i in sequence]
+        for row in rows:
+            self._write_through(row)
         output = {}
         for key in rows[0]:
             output[key] = [r[key] for r in rows]
-            if isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):
+            if key in ('mm_token_type_ids', 'position_ids'):
+                output[key] = np.concatenate([np.asarray(v) for v in output[key]], axis=-1).tolist()
+            elif isinstance(rows[0][key], (list, np.ndarray)) and isinstance(rows[0][key][0], (int, float, np.number)):
                 output[key] = [v for lst in output[key] for v in lst]
         return output
 

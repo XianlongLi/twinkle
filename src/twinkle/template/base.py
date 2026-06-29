@@ -1,15 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import json
 import numpy as np
 import os
 from collections.abc import Mapping
 from copy import copy, deepcopy
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set, Union
 
 from twinkle import remote_class
-from twinkle.data_format import InputFeature, Message, Trajectory
+from twinkle.data_format import InputFeature, Message, Trajectory, user_data_get
 from twinkle.hub import HubOperation
 from twinkle.utils import load_image, to_device
+from .tools import ToolCallRegistry
 from .utils import TokenizeByRound, transfer_to_standard_message
 
 if TYPE_CHECKING:
@@ -30,11 +32,24 @@ class Template:
     video_placeholder: str = '<video>'
     audio_placeholder: str = '<audio>'
 
+    # Encode pipeline stages — class-level so deepcopy/dill fingerprints stay stable
+    # and subclasses can override at class scope rather than re-assigning per instance.
+    pre_pipeline_names: List[str] = [
+        '_add_default_system',
+        '_to_standard_reasoning_content',
+        '_build_standard_messages',
+    ]
+    post_pipeline_names: List[str] = [
+        '_check_max_length',
+        '_add_attention_fields',
+        '_roll_labels',
+    ]
+
     def __init__(self,
                  model_id: str,
                  use_chat_template: bool = True,
                  max_length: Optional[int] = 8192,
-                 truncation_strategy: Literal['raise', 'left', 'right', 'split'] = 'raise',
+                 truncation_strategy: Literal['raise', 'left', 'right', 'split', 'delete'] = 'raise',
                  default_system: Optional[str] = None,
                  enable_thinking: bool = True,
                  **kwargs):
@@ -57,46 +72,20 @@ class Template:
         self.default_system = default_system
         self._test_support_assistant_tokens_mask()
 
-        self.pre_pipeline_names: List[str] = [
-            '_add_default_system',
-            '_to_standard_reasoning_content',
-            '_build_standard_messages',
-        ]
-
-        self.post_pipeline_names: List[str] = [
-            '_check_max_length',
-            '_add_attention_fields',
-            '_roll_labels',
-        ]
-
     def parse_tool_call(self, decoded: str) -> List[Dict[str, Any]]:
         """Parse tool calls from the assistant's decoded output.
 
-        Dispatches by model family on ``self.model_id``; the actual
-        wire-format logic lives in :mod:`.tool_call_parser`.
+        Polls registered :class:`ToolCallParser` in order; first parser whose
+        ``detect`` matches takes ownership and produces the result. Other
+        parsers are not invoked on the same text — prevents nested re-extraction.
         """
-        mid = (self.model_id or '').lower()
-        if 'qwen' in mid:
-            from .qwen import QwenTemplate
-            return QwenTemplate.parse(self, decoded)
-        if 'deepseek' in mid:
-            from .deepseek_v4 import DeepseekV4Template
-            return DeepseekV4Template.parse(self, decoded)
-        # TODO: Other models (Llama3, OpenAI JSON, …) — add a parser in
-        # ``tool_call_parser.py`` and extend this dispatch.
-        return []
+        parser = ToolCallRegistry.detect_first(decoded or '')
+        return parser.parse(decoded) if parser else []
 
     def clean_tool_call(self, decoded: str) -> str:
-        """Strip family-specific tool-call markup from assistant text."""
-        mid = (self.model_id or '').lower()
-        if 'qwen' in mid:
-            from .qwen import QwenTemplate
-            return QwenTemplate.clean(self, decoded)
-        if 'deepseek' in mid:
-            from .deepseek_v4 import DeepseekV4Template
-            return DeepseekV4Template.clean(self, decoded)
-        # TODO: Other models
-        return (decoded or '').rstrip()
+        """Strip tool-call markup using the same parser that ``parse_tool_call`` would pick."""
+        parser = ToolCallRegistry.detect_first(decoded or '')
+        return parser.clean(decoded) if parser else (decoded or '').rstrip()
 
     @property
     def tokenizer(self):
@@ -173,9 +162,14 @@ class Template:
         """Preprocess a list of audio clips."""
         return [self.preprocess_audio(audio) for audio in audios]
 
-    def _invoke_pre_pipeline(self, trajectories: List[Trajectory]) -> List[Trajectory]:
+    def _invoke_pre_pipeline(self,
+                             trajectories: List[Trajectory],
+                             skip_stages: Optional[Set[str]] = None) -> List[Trajectory]:
+        skip_stages = skip_stages or set()
         current = trajectories
         for pipeline_name in self.pre_pipeline_names:
+            if pipeline_name in skip_stages:
+                continue
             pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
             next_batch = []
             for trajectory in current:
@@ -210,10 +204,14 @@ class Template:
             mm_token_type_ids = result['mm_token_type_ids']
             if not isinstance(mm_token_type_ids, torch.Tensor):
                 mm_token_type_ids = torch.as_tensor(mm_token_type_ids)
-            token_ids_shape = mm_token_type_ids.shape
-            device = mm_token_type_ids.device
-            padded_tokens = torch.zeros((token_ids_shape[0], len(new_tokens))).to(device)
-            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=1)
+            # Pad along the last (sequence) dim — handles 1D [T] and 2D [1, T] (Qwen-VL) uniformly.
+            leading_shape = mm_token_type_ids.shape[:-1]
+            padded_tokens = torch.zeros(
+                (*leading_shape, len(new_tokens)),
+                dtype=mm_token_type_ids.dtype,
+                device=mm_token_type_ids.device,
+            )
+            result['mm_token_type_ids'] = torch.cat((mm_token_type_ids, padded_tokens), dim=-1)
         new_input_feature = self._invoke_post_pipeline([result])[0]
         result.update(new_input_feature)
         messages: List[Message] = result.get('messages')
@@ -250,6 +248,10 @@ class Template:
 
                             message['reasoning_content'] = reasoning_content
                             message['content'] = new_content
+                    # Always emit string (never None/missing) — keeps PyArrow struct schema
+                    # stable across shards; empty string renders identically to None in jinja.
+                    if not isinstance(message.get('reasoning_content'), str):
+                        message['reasoning_content'] = ''
 
                 result.append(message)
 
@@ -278,6 +280,8 @@ class Template:
                 result['labels'] = result['labels'][:self.max_length]
             if 'mm_token_type_ids' in result:
                 result['mm_token_type_ids'] = result['mm_token_type_ids'][..., :self.max_length]
+        else:
+            raise ValueError(f'Unsupported truncation_strategy={strategy!r}.')
         return InputFeature(**result)
 
     def set_mm_position_ids(self, input_feature: InputFeature):
@@ -294,6 +298,11 @@ class Template:
 
         # Split strategy
         if strategy == 'split':
+            if self.is_mm:
+                raise ValueError("truncation_strategy='split' is unsafe for multimodal templates: "
+                                 'splitting input_ids across chunks breaks alignment with image tokens, '
+                                 'and multimodal fields (pixel_values, image_grid_thw, ...) are not partitioned. '
+                                 "Use 'left' / 'right' / 'delete' / 'raise' instead.")
             results = []
             for start in range(0, len(input_feature['input_ids']), self.max_length):
                 end = min(start + self.max_length, len(input_feature['input_ids']))
@@ -305,6 +314,12 @@ class Template:
                     feat['mm_token_type_ids'] = feat['mm_token_type_ids'][..., start:end]
                 results.append(InputFeature(**feat))
             return results
+
+        # Drop oversized samples entirely; downstream must tolerate empty list (sample skipped).
+        if strategy == 'delete':
+            if len(input_feature['input_ids']) > self.max_length:
+                return []
+            return [input_feature]
 
         # left/right/raise
         return [self._truncate_feature(input_feature, strategy)]
@@ -491,7 +506,9 @@ class Template:
         trajectory['messages'] = self._process_mm_messages(trajectory['messages'], images, videos, audios)
         if not self.is_mm:
             for message in trajectory['messages']:
-                message['content'] = message['content'][0]['text']
+                c = message.get('content')
+                if isinstance(c, list):
+                    message['content'] = c[0]['text'] if c else ''
         return [trajectory]
 
     def _apply_chat_template(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs):
@@ -506,6 +523,25 @@ class Template:
                 k: v
                 for k, v in b.items() if v is not None
             } for b in msg['content'] if isinstance(b, dict)]
+        for msg in messages:
+            tcs = msg.get('tool_calls')
+            if isinstance(tcs, str):
+                tcs = json.loads(tcs) if tcs else []
+                msg['tool_calls'] = tcs
+            if not tcs:
+                continue
+            new_tcs = []
+            for tc in tcs:
+                fn = tc['function']
+                args = fn['arguments']
+                if isinstance(args, dict):
+                    decoded = args
+                elif isinstance(args, str):
+                    decoded = json.loads(args) if args.strip() else {}
+                else:
+                    decoded = {}
+                new_tcs.append({**tc, 'function': {**fn, 'arguments': decoded}})
+            msg['tool_calls'] = new_tcs
         # ``tool_calls`` / ``tools`` are already OpenAI-shaped (see
         # :mod:`twinkle.data_format.message`); pass them through verbatim.
         tools = list(trajectory.get('tools') or [])
@@ -561,10 +597,20 @@ class Template:
                 **kwargs)
         return inputs
 
+    @staticmethod
+    def _get_train_indices(trajectory: Trajectory) -> Optional[Set[int]]:
+        """You can pick any round for training, only set key_rounds in `user_data`"""
+        kr = user_data_get(trajectory.get('user_data'), 'key_rounds')
+        if isinstance(kr, list) and kr:
+            return set(kr)
+        return None
+
     def _encode_messages(self, trajectory: Trajectory, add_generation_prompt: bool = False, **kwargs) -> InputFeature:
         """Encode a single trajectory's messages into InputFeature."""
         labels = None
         input_ids = None
+        # key-round selective training
+        train_indices = self._get_train_indices(trajectory) if not add_generation_prompt else None
         if self.use_chat_template:
             if add_generation_prompt:
                 # For inference: just get input_ids with generation prompt, no labels needed
@@ -574,12 +620,25 @@ class Template:
                     if hasattr(input_ids, 'squeeze'):
                         input_ids = input_ids.squeeze(0)
                     labels = np.full_like(input_ids, -100)  # No labels for inference
+            elif train_indices is not None:
+                # key-round-only: always use TokenizeByRound with filtered indices
+                if kwargs.get('tokenize', True):
+                    input_ids, labels, encoded = TokenizeByRound.tokenize_with_assistant_labels(
+                        self.tokenizer, self._apply_chat_template, trajectory, train_indices=train_indices, **kwargs)
+                else:
+                    encoded = self._apply_chat_template(trajectory, **kwargs)
             elif self._template_support_assistant_tokens_mask:
                 encoded = self._apply_chat_template(
                     trajectory, return_assistant_tokens_mask=kwargs.get('tokenize', True), **kwargs)
                 if 'input_ids' in encoded:
                     input_ids = encoded.pop('input_ids')
                     assistant_masks = encoded.pop('assistant_masks')
+                    # _apply_chat_template returns batched tensors ([1, T]); strip the batch dim
+                    # so downstream `len(input_ids)` reflects sequence length, not 1.
+                    if hasattr(input_ids, 'squeeze'):
+                        input_ids = input_ids.squeeze(0)
+                    if hasattr(assistant_masks, 'squeeze'):
+                        assistant_masks = assistant_masks.squeeze(0)
                     labels = np.where(assistant_masks, input_ids, -100)
             else:
                 if kwargs.get('tokenize', True):
@@ -719,16 +778,8 @@ class Template:
         return output
 
     def format_trajectory(self, trajectory: Trajectory, add_default_system: bool = False) -> Trajectory:
-        current = [trajectory]
-        for pipeline_name in self.pre_pipeline_names:
-            if not add_default_system and pipeline_name == '_add_default_system':
-                continue
-            pipeline: Callable[[Trajectory], List[Trajectory]] = getattr(self, pipeline_name)
-            next_batch = []
-            for traj in current:
-                next_batch.extend(pipeline(traj))
-            current = next_batch
-        return current[0]
+        skip = set() if add_default_system else {'_add_default_system'}
+        return self._invoke_pre_pipeline([trajectory], skip_stages=skip)[0]
 
     def check(self, trajectory: Trajectory) -> Optional[Trajectory]:
         encoded = None
@@ -776,8 +827,19 @@ class Template:
         kwargs = to_device(self._post_encode(model, old_kwargs), device)
         for k, v in old_kwargs.items():
             if k in {
-                    'input_ids', 'attention_mask', 'labels', 'position_ids', 'output_hidden_states', 'logits_to_keep',
-                    'max_length_q', 'max_length_k', 'cu_seq_lens_q', 'cu_seq_lens_k'
+                    'input_ids',
+                    'attention_mask',
+                    'labels',
+                    'position_ids',
+                    'output_hidden_states',
+                    'logits_to_keep',
+                    'max_length_q',
+                    'max_length_k',
+                    'cu_seq_lens_q',
+                    'cu_seq_lens_k',
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
+                    'packed_seq_params',
             } and k not in kwargs:
                 kwargs[k] = v
         if 'inputs_embeds' in kwargs:
