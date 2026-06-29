@@ -385,10 +385,14 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         Returns ``cleanup_fn``.
         Call *cleanup_fn* after the forward to gather recorded indices(when RECORD) and clear global state.
         """
-        if not self._router_replay_enabled or router_replay_action is None:
+        if not self._router_replay_enabled:
             return lambda: None
 
         self._maybe_apply_router_replay()
+
+        if router_replay_action is None:
+            return lambda: None
+
         from .moe.router_replay import (
             set_router_replay_data, set_global_router_replay_action,
             clear_global_router_replay_action, clear_global_indices,
@@ -688,8 +692,11 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if not should_sync and hasattr(self.model, 'no_sync'):
             no_sync_ctx = self.model.no_sync()
 
-        from .moe.router_replay import RouterReplayAction
-        rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        rr_cleanup = lambda: None
+        if router_replay_action is not None:
+            from .moe.router_replay import RouterReplayAction
+            rr_cleanup = self._router_replay_setup(router_replay_action=RouterReplayAction.REPLAY_BACKWARD)
 
         with no_sync_ctx:
             if scaler is not None:

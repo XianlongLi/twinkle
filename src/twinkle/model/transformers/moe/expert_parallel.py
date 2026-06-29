@@ -232,7 +232,7 @@ def patch_forward(
             hidden_states=hidden_states_2d,
             top_k=top_k,
             router_dtype=_get_router_dtype(cfg.router_dtype, hidden_states_2d.dtype),
-            norm_topk_prob=getattr(block, 'norm_topk_prob', False),
+            norm_topk_prob=_get_norm_topk_prob(block),
             replay_state=replay_state,
             **kwargs,
         )
@@ -406,6 +406,15 @@ def _get_top_k(block: nn.Module) -> int | None:
                 return int(value)
     return None
 
+def _get_norm_topk_prob(block: nn.Module) -> bool:
+    # fix: get norm_topk_prob from gate
+    gate = _get_gate(block)
+    if gate is not None and hasattr(gate, 'norm_topk_prob'):
+        value = getattr(gate, 'norm_topk_prob')
+        if value is not None:
+            return bool(value)
+    # default retrun True
+    return True
 
 def _get_router_dtype(router_dtype: str, default_dtype: torch.dtype) -> torch.dtype:
     if router_dtype == 'fp32':
@@ -425,7 +434,12 @@ def _maybe_run_shared_expert(block: nn.Module, hidden_states_2d: torch.Tensor, c
         shared = getattr(block, 'shared_experts', None)
     if shared is None:
         return None
-    return _run_module_with_casting(shared, hidden_states_2d)
+    shared_output = _run_module_with_casting(shared, hidden_states_2d)
+    shared_gate = getattr(block, 'shared_expert_gate', None)
+    # fix: add shared_expert_gate for Qwen3_5Moe
+    if shared_gate is not None:
+        shared_output = F.sigmoid(shared_gate(hidden_states_2d)) * shared_output
+    return shared_output
 
 
 def _is_moe_experts(experts: Any) -> bool:

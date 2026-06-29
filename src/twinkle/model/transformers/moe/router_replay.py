@@ -217,7 +217,7 @@ def _find_moe_blocks_with_names(model: nn.Module) -> List[tuple[str, nn.Module]]
 def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
     """Replace each MoE block's forward with a wrapper that calls
     ``_run_router()`` instead of the original gate logic."""
-    from .expert_parallel import (_get_gate, _get_top_k, _run_router, 
+    from .expert_parallel import (_get_gate, _get_norm_topk_prob, _get_top_k, _run_router, 
                                   _maybe_run_shared_expert, ExpertParallelConfig)
     import types
 
@@ -230,7 +230,7 @@ def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
         if top_k is None:
             raise ValueError('MoE block must define top_k/num_experts_per_tok.')
 
-        norm_topk_prob = getattr(block, 'norm_topk_prob', False)
+        norm_topk_prob = _get_norm_topk_prob(block)
 
         original_forward = block.forward
         return_annotation = inspect.signature(original_forward).return_annotation
