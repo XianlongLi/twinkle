@@ -8,13 +8,12 @@ recording / replaying expert routing decisions during GRPO training.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
-
 import inspect
 import torch
 import torch.nn as nn
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
 from twinkle import Platform
 from twinkle.utils import get_logger
@@ -25,37 +24,43 @@ logger = get_logger()
 class RouterReplayAction(Enum):
     """A Enum to define the actions for router replay."""
 
-    RECORD = "record"  # Record the topk indices for replay
-    REPLAY_FORWARD = "replay_forward"  # Replay the recorded topk indices for forward pass
-    REPLAY_BACKWARD = "replay_backward"  # Replay topk indices for re-compute during backward pass
+    RECORD = 'record'  # Record the topk indices for replay
+    REPLAY_FORWARD = 'replay_forward'  # Replay the recorded topk indices for forward pass
+    REPLAY_BACKWARD = 'replay_backward'  # Replay topk indices for re-compute during backward pass
+
 
 # ---------------------------------------------------------------------------
 # Global registry: {block_name: _RouterReplayState}
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class _RouterReplayState:
     """Per-MoE-block replay state, stored in the global ``_registry``."""
 
     action: RouterReplayAction = None
-    recorded_indices: Optional[torch.Tensor] = None  # [num_tokens, topk]
-    target_indices: Optional[torch.Tensor] = None    # [num_tokens, topk]
+    recorded_indices: torch.Tensor | None = None  # [num_tokens, topk]
+    target_indices: torch.Tensor | None = None  # [num_tokens, topk]
 
-_registry: Dict[str, _RouterReplayState] = {}
+
+_registry: dict[str, _RouterReplayState] = {}
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def set_global_router_replay_action(action: RouterReplayAction) -> None:
     """Set *action* on every registered MoE block."""
     for state in _registry.values():
         state.action = action
 
+
 def clear_global_router_replay_action() -> None:
     """Reset action to None on every registered MoE block."""
     for state in _registry.values():
         state.action = None
+
 
 def clear_global_indices() -> None:
     """Clear recorded / target indices on every registered MoE block."""
@@ -63,9 +68,11 @@ def clear_global_indices() -> None:
         state.recorded_indices = None
         state.target_indices = None
 
-def get_replay_state(block_name: str) -> Optional[_RouterReplayState]:
+
+def get_replay_state(block_name: str) -> _RouterReplayState | None:
     """Return the replay state for *block_name*, or *None*."""
     return _registry.get(block_name)
+
 
 def set_router_replay_data(
     routed_experts: torch.Tensor,
@@ -85,10 +92,8 @@ def set_router_replay_data(
         return
 
     if routed_experts.dim() != 4:
-        raise ValueError(
-            f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
-            f'got {tuple(routed_experts.shape)}'
-        )
+        raise ValueError(f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
+                         f'got {tuple(routed_experts.shape)}')
 
     # SP: slice full-sequence routed_experts to local SP rank tokens.
     from ..strategy.sequence_parallel import sequence_parallel as sp
@@ -101,7 +106,7 @@ def set_router_replay_data(
             None,
             None,
             None,
-            real_position_ids = sp.real_position_ids,
+            real_position_ids=sp.real_position_ids,
             extra_split_values=[(routed_experts, 0, 1)])
         routed_experts = extra_values[0]
 
@@ -122,7 +127,8 @@ def set_router_replay_data(
         if target.numel() > 0:
             state.target_indices = target
 
-def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Tensor]:
+
+def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | None:
     """Collect ``recorded_indices`` from all registered MoE blocks in *model*.
 
     . note::
@@ -135,7 +141,7 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
     blocks = _find_moe_blocks_with_names(model)
     if not blocks:
         return None
-    
+
     layers = []
     for name, _ in blocks:
         state = _registry.get(name)
@@ -144,7 +150,7 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
 
     if not layers:
         return None
-    
+
     # Stack: [num_tokens, num_layers, topk]
     routed_experts = torch.stack(layers, dim=1)
     _, num_layers, topk = routed_experts.shape
@@ -159,6 +165,7 @@ def get_router_replay_data(model: nn.Module, batch_size=1) -> Optional[torch.Ten
 
     # [bs, seq_len, num_layers, topk]
     return routed_experts
+
 
 def apply_router_replay_patch(model: nn.Module) -> None:
     """Register MoE blocks and (for EP=1) wrap their forwards through
@@ -188,10 +195,8 @@ def apply_router_replay_patch(model: nn.Module) -> None:
     # Check whether the first block's forward has already been EP-patched
     _, first_block = blocks[0]
     if _is_ep_patched(first_block):
-        logger.debug(
-            'EP patches detected — routing replay piggy-backs on '
-            'patch_forward() replay_state wiring.'
-        )
+        logger.debug('EP patches detected — routing replay piggy-backs on '
+                     'patch_forward() replay_state wiring.')
         return
 
     # EP = 1: wrap each MoE block forward through _run_router()
@@ -199,27 +204,33 @@ def apply_router_replay_patch(model: nn.Module) -> None:
     _wrap_all_moe_blocks(blocks)
     model._rr_patched = True
 
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_ep_patched(block: nn.Module) -> bool:
     """Return True if *block* has already been patched by expert_parallel."""
     return getattr(block, '_ep_patched', False)
 
-def _find_moe_blocks_with_names(model: nn.Module) -> List[tuple[str, nn.Module]]:
+
+def _find_moe_blocks_with_names(model: nn.Module) -> list[tuple[str, nn.Module]]:
     from .expert_parallel import find_moe_blocks_with_names
+
     # Strip PEFT wrapper so block names match those used by EP patch_forward
     unwrap = model.get_base_model() if hasattr(model, 'get_base_model') else model
     blocks = list(find_moe_blocks_with_names(unwrap))
     return blocks
 
-def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
+
+def _wrap_all_moe_blocks(blocks: list[tuple[str, nn.Module]], ) -> None:
     """Replace each MoE block's forward with a wrapper that calls
     ``_run_router()`` instead of the original gate logic."""
-    from .expert_parallel import (_get_gate, _get_norm_topk_prob, _get_top_k, _run_router, 
-                                  _maybe_run_shared_expert, ExpertParallelConfig)
     import types
+
+    from .expert_parallel import (ExpertParallelConfig, _get_gate, _get_norm_topk_prob, _get_top_k,
+                                  _maybe_run_shared_expert, _run_router)
 
     for name, block in blocks:
         gate = _get_gate(block)
@@ -240,6 +251,7 @@ def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
         )
 
         def _make_patched_forward(_name, _block, _gate, _top_k, _norm_topk_prob, _returns_router_logits):
+
             def patched_forward(self, hidden_states):
                 orig_shape = hidden_states.shape
                 if hidden_states.ndim == 3:
@@ -265,7 +277,8 @@ def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
                 if isinstance(self.experts, nn.ModuleList):
                     routed_output = torch.zeros_like(hidden_states_2d)
                     num_experts = len(self.experts)
-                    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+                    expert_mask = torch.nn.functional.one_hot(
+                        selected_experts, num_classes=num_experts).permute(2, 1, 0)
                     expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
                     for expert_idx in expert_hit:
                         expert_layer = self.experts[expert_idx]
@@ -274,9 +287,7 @@ def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
                         current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
                         routed_output.index_add_(0, top_x, current_hidden_states.to(hidden_states_2d.dtype))
                 else:
-                    routed_output = self.experts(
-                        hidden_states_2d, selected_experts, routing_weights
-                    )
+                    routed_output = self.experts(hidden_states_2d, selected_experts, routing_weights)
 
                 shared_out = _maybe_run_shared_expert(_block, hidden_states_2d, ExpertParallelConfig())
                 if shared_out is not None:

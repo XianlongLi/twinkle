@@ -406,6 +406,7 @@ def _get_top_k(block: nn.Module) -> int | None:
                 return int(value)
     return None
 
+
 def _get_norm_topk_prob(block: nn.Module) -> bool:
     # fix: get norm_topk_prob from gate
     gate = _get_gate(block)
@@ -415,6 +416,7 @@ def _get_norm_topk_prob(block: nn.Module) -> bool:
             return bool(value)
     # default retrun True
     return True
+
 
 def _get_router_dtype(router_dtype: str, default_dtype: torch.dtype) -> torch.dtype:
     if router_dtype == 'fp32':
@@ -559,8 +561,7 @@ def _run_router(
     from .router_replay import RouterReplayAction
 
     # --- REPLAY_FORWARD: use injected selected_experts ---
-    if (replay_state is not None
-            and replay_state.action != RouterReplayAction.RECORD
+    if (replay_state is not None and replay_state.action != RouterReplayAction.RECORD
             and replay_state.target_indices is not None):
         selected_experts = replay_state.target_indices
         routing_weights = torch.softmax(router_logits, dim=-1, dtype=router_dtype)
@@ -579,8 +580,7 @@ def _run_router(
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
     # --- RECORD: save selected_experts after computing them ---
-    if (replay_state is not None
-            and replay_state.action == RouterReplayAction.RECORD):
+    if (replay_state is not None and replay_state.action == RouterReplayAction.RECORD):
         replay_state.recorded_indices = selected_experts.detach().clone()
 
     return router_logits, routing_weights, selected_experts

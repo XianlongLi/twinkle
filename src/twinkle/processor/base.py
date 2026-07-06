@@ -452,8 +452,8 @@ class InputProcessor:
     def _pad_sequence(sequences, padding_value, padding_side, concat=None):
         if padding_side == 'right':
             from twinkle.utils import pad_and_stack_tensors
-            return pad_and_stack_tensors(sequences, pad_value=padding_value,
-                                         concat=concat if concat is not None else (sequences[0].dim() >= 2))
+            return pad_and_stack_tensors(
+                sequences, pad_value=padding_value, concat=concat if concat is not None else (sequences[0].dim() >= 2))
         else:
             # left padding
             import torch
@@ -823,7 +823,8 @@ class InputProcessor:
                 padding_len = input_seq_len - experts_seq_len
                 if padding_len > 0:
                     padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
-                                                                     'constant', self.padding_map.get('routed_experts', 0))
+                                                                     'constant',
+                                                                     self.padding_map.get('routed_experts', 0))
                 _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
 
             return _input

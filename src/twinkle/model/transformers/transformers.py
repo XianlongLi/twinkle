@@ -378,8 +378,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         apply_router_replay_patch(model)
         self._router_replay_applied = True
 
-    def _router_replay_setup(self, router_replay_action, routed_experts=None,
-                             batch_size=1, manual_cleanup=False):
+    def _router_replay_setup(self, router_replay_action, routed_experts=None, batch_size=1, manual_cleanup=False):
         """Set up routing replay before a model forward.
 
         Returns ``cleanup_fn``.
@@ -393,11 +392,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if router_replay_action is None:
             return lambda: None
 
-        from .moe.router_replay import (
-            set_router_replay_data, set_global_router_replay_action,
-            clear_global_router_replay_action, clear_global_indices,
-            RouterReplayAction, get_router_replay_data,
-        )
+        from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
+                                        get_router_replay_data, set_global_router_replay_action, set_router_replay_data)
         unwrapped = self.strategy.unwrap_model(self.model)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
@@ -482,8 +478,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         routed_experts = inputs.pop('routed_experts', None)
         batch_size = labels.shape[0] if labels is not None else (
             inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-        rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts,
-                                               batch_size, router_replay_manual_cleanup)
+        rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
+                                               router_replay_manual_cleanup)
 
         with _resolve_task_context(self.model, task):
             outputs = self.model(**inputs)
@@ -573,8 +569,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             routed_experts = inputs.pop('routed_experts', None)
             batch_size = labels.shape[0] if labels is not None else (
                 inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
-            rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts,
-                                                   batch_size, router_replay_manual_cleanup)
+            rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
+                                                   router_replay_manual_cleanup)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()
