@@ -261,9 +261,22 @@ def _wrap_all_moe_blocks(blocks: List[tuple[str, nn.Module]],) -> None:
                     norm_topk_prob=_norm_topk_prob,
                     replay_state=replay_state,
                 )
-                routed_output = self.experts(
-                    hidden_states_2d, selected_experts, routing_weights
-                )
+
+                if isinstance(self.experts, nn.ModuleList):
+                    routed_output = torch.zeros_like(hidden_states_2d)
+                    num_experts = len(self.experts)
+                    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
+                    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+                    for expert_idx in expert_hit:
+                        expert_layer = self.experts[expert_idx]
+                        idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+                        current_state = hidden_states_2d[top_x]
+                        current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+                        routed_output.index_add_(0, top_x, current_hidden_states.to(hidden_states_2d.dtype))
+                else:
+                    routed_output = self.experts(
+                        hidden_states_2d, selected_experts, routing_weights
+                    )
 
                 shared_out = _maybe_run_shared_expert(_block, hidden_states_2d, ExpertParallelConfig())
                 if shared_out is not None:

@@ -480,8 +480,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         router_replay_action = kwargs.pop('router_replay_action', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         routed_experts = inputs.pop('routed_experts', None)
+        batch_size = labels.shape[0] if labels is not None else (
+            inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
         rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts,
-                                               labels.shape[0], router_replay_manual_cleanup)
+                                               batch_size, router_replay_manual_cleanup)
 
         with _resolve_task_context(self.model, task):
             outputs = self.model(**inputs)
@@ -569,8 +571,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             router_replay_action = kwargs.pop('router_replay_action', None)
             router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
             routed_experts = inputs.pop('routed_experts', None)
+            batch_size = labels.shape[0] if labels is not None else (
+                inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
             rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts,
-                                                   labels.shape[0], router_replay_manual_cleanup)
+                                                   batch_size, router_replay_manual_cleanup)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()

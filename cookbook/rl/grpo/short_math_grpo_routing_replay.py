@@ -297,7 +297,8 @@ def main():
             mb_inputs = all_input_data[mb_start:mb_end]
             mb_old_logps = all_old_logps[mb_start:mb_end]
             mb_advantages = advantages[mb_start:mb_end]
-            recompute_logps = [input.pop('old_logps').unsqueeze(0) for input in mb_inputs]
+            for input in mb_inputs:
+                input.pop('old_logps', None)
 
             mb_output = model.forward_backward(
                 inputs=mb_inputs,
