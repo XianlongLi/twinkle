@@ -408,14 +408,14 @@ def _get_top_k(block: nn.Module) -> int | None:
 
 
 def _get_norm_topk_prob(block: nn.Module) -> bool:
-    # fix: get norm_topk_prob from gate
-    gate = _get_gate(block)
-    if gate is not None and hasattr(gate, 'norm_topk_prob'):
-        value = getattr(gate, 'norm_topk_prob')
-        if value is not None:
-            return bool(value)
-    # default retrun True
-    return True
+    value = getattr(block, 'norm_topk_prob', None)
+    if value is None:
+        # fix: Attempt to fetch from the gate if block does not exist
+        gate = _get_gate(block)
+        value = getattr(gate, 'norm_topk_prob', None)
+    # Default return True.
+    # For Qwen3-5MoE, the `norm_topk_prob` attribute does not exist, and normalization is performed by default.
+    return bool(value) if value is not None else True
 
 
 def _get_router_dtype(router_dtype: str, default_dtype: torch.dtype) -> torch.dtype:
